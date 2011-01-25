@@ -1,0 +1,6 @@
+[submodule "src/picoev"]
+	path = src/picoev
+	url = https://github.com/kazuho/picoev.git
+[submodule "src/picohttpparser"]
+	path = src/picohttpparser
+	url = https://github.com/kazuho/picohttpparser.git
