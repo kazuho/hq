@@ -1,0 +1,3 @@
+bin_PROGRAMS=	hq
+hq_SOURCES=	hq.cc
+hq_CXXFLAGS=	$(AM_CFLAGS) $(AM_CXXFLAGS)
