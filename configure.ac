@@ -8,4 +8,5 @@ AC_PROG_CC_C_O
 AC_PROG_CXX
 AC_PROG_CPP
 
+AM_CONFIG_HEADER(src/config.h)
 AC_OUTPUT(Makefile src/Makefile)
