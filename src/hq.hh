@@ -16,6 +16,39 @@ extern "C" {
 #include "cac/cac_mutex.h"
 
 /**
+ * utility class for tls
+ */
+template <typename T> class hq_tls {
+protected:
+  pthread_key_t key_;
+public:
+  hq_tls() {
+    pthread_key_create(&key_, _dtor);
+  }
+  ~hq_tls() {
+    pthread_key_delete(key_);
+  }
+  const T& operator*() const { return *_get(); }
+  T& operator*() { return *_get(); }
+  const T& operator->() const { return *_get(); }
+  T& operator->() { return *_get(); }
+protected:
+  T* _get() {
+    T* t = reinterpret_cast<T*>(pthread_getspecific(key_));
+    if (t == NULL) {
+      t = new T();
+      pthread_setspecific(key_, t);
+    }
+    return t;
+  }
+  static void _dtor(void* p) {
+    if (p != NULL) {
+      delete reinterpret_cast<T*>(p);
+    }
+  }
+};
+  
+/**
  * utility class for type-safe callback generation
  */
 template <typename T, void (T::*FUNC)(int fd, int revents)>
@@ -281,18 +314,26 @@ public:
 class hq_loop {
 protected:
   int listen_fd_;
-  picoev_loop* loop_;
 public:
   /**
    * constructor
    */
   hq_loop(int listen_fd);
   /**
+   * desctructor
+   */
+  ~hq_loop();
+  /**
    * main loop
    */
   void run_loop();
 protected:
   void accept_conn(int fd, int revents);
+private:
+  hq_loop(const hq_loop&); // not used
+  hq_loop& operator=(const hq_loop&); // not used
+protected:
+  static hq_tls<picoev_loop*> loop_;
 public:
   static picoev_loop* get_loop();
 };

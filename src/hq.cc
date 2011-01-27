@@ -16,6 +16,7 @@ extern "C" {
 }
 #include "hq.hh"
 
+#define MAX_FDS 1024
 #define READ_MAX 131072
 #define MAX_HEADERS 256
 #define TIMEOUT_SECS 60
@@ -578,11 +579,23 @@ static void setup_sock(int fd)
 }
 
 hq_loop::hq_loop(int listen_fd)
-  : listen_fd_(listen_fd), loop_(NULL)
+  : listen_fd_(listen_fd)
 {
-  loop_ = picoev_create_loop(TIMEOUT_SECS);
-  picoev_add(loop_, listen_fd_, PICOEV_READ, 0,
+  *loop_ = picoev_create_loop(TIMEOUT_SECS);
+  picoev_add(*loop_, listen_fd_, PICOEV_READ, 0,
 	     hq_picoev_cb<hq_loop, &hq_loop::accept_conn>, this);
+}
+
+hq_loop::~hq_loop()
+{
+  picoev_destroy_loop(*loop_);
+}
+
+void hq_loop::run_loop()
+{
+  while (1) {
+    picoev_loop_once(*loop_, TIMEOUT_SECS);
+  }
 }
 
 void hq_loop::accept_conn(int fd, int revents)
@@ -598,10 +611,11 @@ void hq_loop::accept_conn(int fd, int revents)
   new hq_client(newfd);
 }
 
+hq_tls<picoev_loop*> hq_loop::loop_;
+
 picoev_loop* hq_loop::get_loop()
 {
-  // TODO fixme
-  return NULL;
+  return *loop_;
 }
 
 hq_headers::const_iterator hq_util::find_header(const hq_headers& hdrs, const string& name)
@@ -627,6 +641,27 @@ hq_headers::const_iterator hq_util::find_header(const hq_headers& hdrs, const st
 
 int main(int argc, char** argv)
 {
-  fputs("hello world!\n", stdout);
+  int listen_fd, flag, r;
+  
+  listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  assert(listen_fd != -1);
+  flag = 1;
+  r = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+  assert(r == 0);
+  struct sockaddr_in sa;
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(10987);
+  sa.sin_addr.s_addr = htonl(0);
+  r = bind(listen_fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+  assert(r == 0);
+  setup_sock(listen_fd);
+  r = listen(listen_fd, SOMAXCONN);
+  assert(r == 0);
+  
+  picoev_init(MAX_FDS);
+  
+  hq_loop loop(listen_fd);
+  loop.run_loop();
+  
   return 0;
 }
