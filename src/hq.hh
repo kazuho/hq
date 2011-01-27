@@ -206,6 +206,10 @@ public:
 class hq_res_sender {
 public:
   /**
+   * sends a file
+   */
+  virtual void send_file_response(int status, const std::string& msg, const hq_headers& headers, int fd) = 0;
+  /**
    * starts a response
    */
   virtual bool open_response(int status, const std::string& msg, const hq_headers& headers, const char* data, size_t len) = 0;
@@ -220,14 +224,27 @@ public:
 };
 
 /**
- * interface for handling requests
+ * interface for handling requests (handlers should inherit this interface)
  */
 class hq_handler {
 public:
+  /**
+   * destructor
+   */
   virtual ~hq_handler() {}
+  /**
+   * dispatches a request
+   * @return whether or not the request was dispatched
+   */
   virtual bool dispatch(const hq_req_reader& req, hq_res_sender* res_sender) = 0;
 public:
+  /**
+   * dispatches a request
+   */
   static void dispatch_request(const hq_req_reader& req, hq_res_sender* res_sender);
+  /**
+   * sends an error response
+   */
   static void send_error(const hq_req_reader& req, hq_res_sender* res_sender, int status, const std::string& msg);
 };
 
@@ -241,6 +258,10 @@ protected:
   struct {
     hq_buffer sendbuf;
     bool closed_by_sender;
+    struct {
+      int fd;
+      off_t pos, size;
+    } sendfile;
   } res_;
 public:
   /**
@@ -254,12 +275,15 @@ public:
 protected:
   void _start();
   void _read_request(int fd, int revents);
+  virtual void send_file_response(int status, const std::string& msg, const hq_headers& headers, int fd);
   virtual bool open_response(int status, const std::string& msg, const hq_headers& headers, const char* data, size_t len);
   virtual bool send_response(const char* data, size_t len);
   virtual void close_response();
+  void _prepare_response(int status, const std::string& msg, const hq_headers& hedaers, const int sendfile_fd);
   void _finalize_response();
+  void _write_sendfile_cb(int fd, int revents);
   void _write_sendbuf_cb(int fd, int revents);
-  bool _write_sendbuf();
+  bool _write_sendbuf(bool disactivate_poll_when_empty);
 };
 
 /**
@@ -267,26 +291,46 @@ protected:
  */
 class hq_worker {
 public:
+  /**
+   * handler
+   */
   class handler : public hq_handler {
     friend class hq_worker;
+    /**
+     * represents a request unassociated to a worker
+     */
     struct req_queue_entry {
       const hq_req_reader* req;
       hq_res_sender* res_sender;
-      time_t at;
       req_queue_entry(const hq_req_reader* r, hq_res_sender* rs)
-	: req(r), res_sender(rs), at(time(NULL)) {}
+	: req(r), res_sender(rs) {}
     };
   protected:
+    /**
+     * list of unassociated requests and idle workers protected by a mutex
+     */
     struct junction {
       std::list<req_queue_entry> reqs;
       std::list<hq_worker*> workers;
-    } ;
+    };
     cac_mutex_t<junction> junction_;
   public:
+    /**
+     * constructor
+     */
     handler();
+    /**
+     * destructor
+     */
     virtual ~handler();
+    /**
+     * dispatches a request
+     */
     virtual bool dispatch(const hq_req_reader& req, hq_res_sender* res_sender);
   protected:
+    /**
+     * starts a worker if any pending request exists, or registers the worker to wait for requests
+     */
     void _start_worker_or_register(hq_worker* worker);
   };
 protected:

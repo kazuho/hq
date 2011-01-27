@@ -1,5 +1,3 @@
-#include <stdio.h>
-
 extern "C" {
 #include <errno.h>
 #include <fcntl.h>
@@ -7,9 +5,12 @@ extern "C" {
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 }
 #include <algorithm>
+
+#include "config.h"
 
 extern "C" {
 #include "picohttpparser/picohttpparser.h"
@@ -227,43 +228,29 @@ void hq_client::_read_request(int fd, int revents)
   hq_handler::dispatch_request(req_, this);
 }
 
+void hq_client::send_file_response(int status, const string& msg, const hq_headers& headers, int fd)
+{
+  _prepare_response(status, msg, headers, fd);
+  
+  _write_sendfile_cb(fd_, PICOEV_WRITE);
+}
+
 bool hq_client::open_response(int status, const string& msg, const hq_headers& headers, const char* data, size_t len)
 {
-  picoev_add(hq_loop::get_loop(), fd_, 0, 0,
-	     hq_picoev_cb<hq_client, &hq_client::_write_sendbuf_cb>, this);
-  
-  res_.sendbuf.clear();
-  res_.closed_by_sender = false;
-  
-  // TODO support for keep-alive and HTTP/1.1
-  char buf[sizeof("HTTP/1.0 -1234567890 ")];
-  sprintf(buf, "HTTP/1.1 %d ", status);
-  res_.sendbuf.push(buf, strlen(buf));
-  res_.sendbuf.push(msg);
-  res_.sendbuf.push("\r\n", 2);
-  for (hq_headers::const_iterator i = headers.begin(); i != headers.end();
-       ++i) {
-    // TODO should we sanitize headers like Connection here?
-    res_.sendbuf.push(i->first);
-    res_.sendbuf.push(": ", 2);
-    res_.sendbuf.push(i->second);
-    res_.sendbuf.push("\r\n", 2);
-  }
-  res_.sendbuf.push("\r\n", 2);
-  
   // TODO check content-length and content-encoding to privent res. splitting
-  
+  _prepare_response(status, msg, headers, -1);
+  res_.closed_by_sender = false;
   if (len != 0) {
     res_.sendbuf.push(data, len);
   }
   
-  return _write_sendbuf();
+  return _write_sendbuf(true);
 }
 
 bool hq_client::send_response(const char* data, size_t len)
 {
   res_.sendbuf.push(data, len);
-  return _write_sendbuf();
+  return _write_sendbuf(true);
 }
 
 void hq_client::close_response()
@@ -274,9 +261,105 @@ void hq_client::close_response()
   }
 }
 
+void hq_client::_prepare_response(int status, const string& msg, const hq_headers& headers, const int sendfile_fd)
+{
+  picoev_add(hq_loop::get_loop(), fd_, 0, 0,
+	     hq_picoev_cb<hq_client, &hq_client::_write_sendbuf_cb>, this);
+  
+  res_.sendbuf.clear();
+  if (sendfile_fd != -1) {
+    res_.closed_by_sender = true;
+    res_.sendfile.fd = sendfile_fd;
+    res_.sendfile.pos = 0;
+    struct stat st;
+    int r = fstat(res_.sendfile.fd, &st);
+    assert(r == 0); // fstat error is really fatal
+    res_.sendfile.size = st.st_size;
+  } else {
+    res_.closed_by_sender = false;
+    res_.sendfile.fd = -1;
+    res_.sendfile.pos = 0;
+    res_.sendfile.size = 0;
+  }
+  
+  // TODO support for keep-alive and HTTP/1.1
+  {
+    char buf[sizeof("HTTP/1.0 -1234567890 ")];
+    sprintf(buf, "HTTP/1.1 %d ", status);
+    res_.sendbuf.push(buf, strlen(buf));
+  }
+  res_.sendbuf.push(msg);
+  res_.sendbuf.push("\r\n", 2);
+  if (res_.sendfile.fd != -1) {
+    char buf[sizeof("Content-Length: \r\n") + 24];
+    sprintf(buf, "Content-Length: %llu\r\n",
+	    (unsigned long long)res_.sendfile.size);
+    res_.sendbuf.push(buf, strlen(buf));
+  }
+  for (hq_headers::const_iterator i = headers.begin();
+       i != headers.end();
+       ++i) {
+    // TODO should we sanitize headers like Connection, Content-Length here?
+    res_.sendbuf.push(i->first);
+    res_.sendbuf.push(": ", 2);
+    res_.sendbuf.push(i->second);
+    res_.sendbuf.push("\r\n", 2);
+  }
+  res_.sendbuf.push("\r\n", 2);
+}
+
 void hq_client::_finalize_response()
 {
   // TODO support for persistent connection
+  delete this;
+}
+
+void hq_client::_write_sendfile_cb(int fd, int revents)
+{
+  assert(fd_ == fd);
+  assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
+  
+  // flush header
+  if (! res_.sendbuf.empty()) {
+    if (! _write_sendbuf(false)) {
+      goto ON_CLOSE;
+    }
+    if (! res_.sendbuf.empty()) {
+      return;
+    }
+  }
+  
+  // no more headers in buffer, send file
+ RETRY:
+  int r;
+#if HQ_IS_LINUX
+  r = sendfile(fd_, res_.sendfile.fd, &res_.sendfile.pos, 1048576);
+#elif HQ_IS_BSD
+  {
+    off_t len = 1048576;
+    if ((r = sendfile(fd_, res_.sendfile.fd, res_.sendfile.pos, &len, NULL, 0))
+	== 0) {
+      res_.sendfile.pos += len;
+    }
+  }
+#else
+  #error "do not know the sendfile API for this OS"
+#endif
+  if (r == 0) {
+    if (res_.sendfile.pos == res_.sendfile.size) {
+      _finalize_response();
+      return;
+    }
+  } else if (errno == EINTR) {
+    goto RETRY;
+  } else if (! (errno == EAGAIN || EWOULDBLOCK)) {
+    // TODO LOG
+    goto ON_CLOSE;
+  }
+  picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
+  return;
+  
+ ON_CLOSE:
   delete this;
 }
 
@@ -285,7 +368,7 @@ void hq_client::_write_sendbuf_cb(int fd, int revents)
   assert(fd_ == fd);
   assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
   
-  if (! _write_sendbuf()) {
+  if (! _write_sendbuf(true)) {
     return;
   }
   if (res_.sendbuf.empty() && res_.closed_by_sender) {
@@ -293,35 +376,21 @@ void hq_client::_write_sendbuf_cb(int fd, int revents)
   }
 }
 
-bool hq_client::_write_sendbuf()
+bool hq_client::_write_sendbuf(bool disactivate_poll_when_empty)
 {
   int r;
   
  RETRY:
-  r = write(fd_, res_.sendbuf.buffer(), res_.sendbuf.size());
-  switch (r) {
-  case 0: // closed by peer
+  if ((r = write(fd_, res_.sendbuf.buffer(), res_.sendbuf.size())) != -1) {
+    res_.sendbuf.advance(r);
+  } else if (errno == EINTR) {
+    goto RETRY;
+  } else if (! (errno == EINTR || errno == EWOULDBLOCK)) {
     // TODO LOG
     goto ON_CLOSE;
-  case -1: // error
-    switch (errno) {
-    case EINTR:
-      goto RETRY;
-    case EWOULDBLOCK:
-      picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
-      break;
-    default:
-      // TODO LOG
-      goto ON_CLOSE;
-    }
-    break;
-  default: // wrote some bytes
-    res_.sendbuf.advance(r);
-    if (res_.sendbuf.empty()) {
-      picoev_set_events(hq_loop::get_loop(), fd_, 0);
-    }
-    break;
   }
+  picoev_set_events(hq_loop::get_loop(), fd_,
+		    res_.sendbuf.empty() ? 0 : PICOEV_WRITE);
   return true;
   
  ON_CLOSE:
@@ -435,12 +504,7 @@ void hq_worker::_send_request()
   int r;
   
  RETRY:
-  if ((r = write(fd_, buf_.buffer(), buf_.size())) == 0) {
-    // closed
-    // TODO LOG
-    _return_error(500, "connection closed by worker");
-    goto CLOSE;
-  } else if (r == -1) {
+  if ((r = write(fd_, buf_.buffer(), buf_.size())) == -1) {
     if (r == EINTR) {
       goto RETRY;
     } else if (r == EAGAIN || r == EWOULDBLOCK) {
