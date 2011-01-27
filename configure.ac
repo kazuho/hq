@@ -8,5 +8,9 @@ AM_PROG_CC_C_O
 AC_PROG_CXX
 AC_PROG_CPP
 
+OS=`uname -s | tr "[[:upper:]]" "[[:lower:]]"`
+AM_CONDITIONAL([PICOEV_USE_EPOLL], [ test "$OS" = "linux" ])
+AM_CONDITIONAL([PICOEV_USE_KQUEUE],  [test "$OS" = "darwin" -o "$OS" = "freebsd" ])
+
 AM_CONFIG_HEADER(src/config.h)
 AC_OUTPUT(Makefile src/Makefile)
