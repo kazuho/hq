@@ -101,6 +101,7 @@ public:
    * push data onto the buffer
    */
   void push(const char byte) {
+    assert(size_ <= buf_.size());
     buf_.erase(buf_.begin() + size_, buf_.end());
     buf_.push_back(byte);
     size_++;
@@ -109,6 +110,7 @@ public:
    * push data onto the buffer
    */
   void push(const char* data, size_t len) {
+    assert(size_ <= buf_.size());
     buf_.erase(buf_.begin() + size_, buf_.end());
     buf_.insert(buf_.end(), data, data + len);
     size_ += len;
@@ -117,6 +119,7 @@ public:
    * push data onto the buffer
    */
   void push(const std::string& s) {
+    assert(size_ <= buf_.size());
     buf_.erase(buf_.begin() + size_, buf_.end());
     buf_.insert(buf_.end(), &*s.begin(), &*s.end());
     size_ += s.size();
@@ -125,8 +128,9 @@ public:
    * prepares space for additional sz bytes in the buffer and returns pointer to the space
    */
   char* prepare(size_t sz) {
-    while (size_ + sz > buf_.size()) {
-      buf_.insert(buf_.end(), '\0', buf_.size());
+    assert(size_ <= buf_.size());
+    if (size_ + sz > buf_.size()) {
+      buf_.insert(buf_.end(), size_ + sz - buf_.size(), '\0');
     }
     return &*buf_.begin() + size_;
   }
@@ -278,13 +282,12 @@ public:
       std::list<hq_worker*> workers;
     } ;
     cac_mutex_t<junction> junction_;
-    pthread_cond_t junction_cond_;
   public:
     handler();
     virtual ~handler();
-    bool dispatch(const hq_req_reader& req, hq_res_sender* res_sender);
+    virtual bool dispatch(const hq_req_reader& req, hq_res_sender* res_sender);
   protected:
-    bool _fetch_request(const hq_req_reader*& req, hq_res_sender*& res_sender);
+    void _start_worker_or_register(hq_worker* worker);
   };
 protected:
   int fd_;
@@ -301,7 +304,8 @@ public:
    */
   ~hq_worker();
 protected:
-  void _start();
+  void _prepare_next();
+  void _start(const hq_req_reader* req, hq_res_sender* res_sender);
   void _send_request_cb(int fd, int revents);
   void _send_request();
   void _read_response_header(int fd, int revents);

@@ -51,10 +51,7 @@ hq_req_reader::read_request(int fd)
 bool
 hq_req_reader::_read_request(int fd)
 {
-  const char* method, * path;
-  phr_header hdrs[MAX_HEADERS];
-  size_t method_len, path_len, num_hdrs = MAX_HEADERS;
-  int minor_version, r;
+  int r;
 
  RETRY:
   if ((r = read(fd, buf_.prepare(READ_MAX), READ_MAX)) == 0) {
@@ -74,29 +71,35 @@ hq_req_reader::_read_request(int fd)
   
   // read some bytes
   buf_.adjust_size(r);
-  num_hdrs = MAX_HEADERS;
-  r = phr_parse_request(buf_.buffer(), buf_.size(), &method, &method_len, &path,
-			&path_len, &minor_version, hdrs, &num_hdrs, 0);
-  if (r == -1) { // error
-    // TODO LOG
-    return false;
-  } else if (r == -2) { // partial
-    return true;
-  }
-  // got request
-  method_.insert(method_.end(), method, method + method_len);
-  path_.insert(path_.end(), path, path + path_len);
-  for (size_t i = 0; i < num_hdrs; i++) {
-    if (hdrs[i].name == NULL) {
-      // continuing line
-      assert(i != 0);
-      headers_.back().second.insert(headers_.back().second.end(), hdrs[i].value,
-				    hdrs[i].value + hdrs[i].value_len);
-    } else {
-      headers_.push_back(make_pair(string(hdrs[i].name,
-					  hdrs[i].name + hdrs[i].name_len),
-				   string(hdrs[i].value,
-					  hdrs[i].value + hdrs[i].value_len)));
+  {
+    const char* method, * path;
+    int minor_version;
+    phr_header hdrs[MAX_HEADERS];
+    size_t method_len, path_len, num_hdrs = MAX_HEADERS;
+    r = phr_parse_request(buf_.buffer(), buf_.size(), &method, &method_len,
+			  &path, &path_len, &minor_version, hdrs, &num_hdrs, 0);
+    if (r == -1) { // error
+      // TODO LOG
+      return false;
+    } else if (r == -2) { // partial
+      return true;
+    }
+    // got request
+    method_ = string(method, method + method_len);
+    path_ = string(path, path + path_len);
+    for (size_t i = 0; i < num_hdrs; i++) {
+      if (hdrs[i].name == NULL) {
+	// continuing line
+	assert(i != 0);
+	headers_.back().second.insert(headers_.back().second.end(),
+				      hdrs[i].value,
+				      hdrs[i].value + hdrs[i].value_len);
+      } else {
+	headers_.push_back(make_pair(string(hdrs[i].name,
+					    hdrs[i].name + hdrs[i].name_len),
+				     string(hdrs[i].value,
+					    hdrs[i].value + hdrs[i].value_len)));
+      }
     }
   }
   buf_.advance(r);
@@ -156,8 +159,7 @@ bool hq_req_reader::_read_content(int fd)
 void hq_handler::dispatch_request(const hq_req_reader& req, hq_res_sender* res_sender)
 {
   // TODO should be configurable and support other handlers (like static content) as well
-  static hq_worker::handler worker_handler;
-  if (worker_handler.dispatch(req, res_sender)) {
+  if (hq_worker::handler_.dispatch(req, res_sender)) {
     return;
   }
   send_error(req, res_sender, 500, "no handler");
@@ -182,7 +184,9 @@ hq_client::hq_client(int fd)
 
 hq_client::~hq_client()
 {
-  picoev_del(hq_loop::get_loop(), fd_);
+  if (picoev_is_active(hq_loop::get_loop(), fd_)) {
+    picoev_del(hq_loop::get_loop(), fd_);
+  }
   close(fd_);
 }
 
@@ -328,67 +332,80 @@ bool hq_client::_write_sendbuf()
 hq_worker::handler::handler()
   : junction_(NULL)
 {
-  pthread_cond_init(&junction_cond_, NULL);
 }
 
 hq_worker::handler::~handler()
 {
   // TODO gracefully shutdown
-  pthread_cond_destroy(&junction_cond_);
 }
 
 bool hq_worker::handler::dispatch(const hq_req_reader& req, hq_res_sender* res_sender)
 {
-  cac_mutex_t<junction>::lockref junction(junction_);
-  junction->reqs.push_back(req_queue_entry(&req, res_sender));
-  if (! junction->workers.empty()) {
-    pthread_cond_signal(&junction_cond_);
+  // obtain worker or register myself
+  hq_worker* worker = NULL;
+  {
+    cac_mutex_t<junction>::lockref junction(junction_);
+    if (junction->workers.empty()) {
+      junction->reqs.push_back(req_queue_entry(&req, res_sender));
+    } else {
+      worker = junction->workers.front();
+      junction->workers.pop_front();
+    }
   }
+  
+  if (worker != NULL) {
+    worker->_start(&req, res_sender);
+  }
+  
   return true;
 }
 
-bool hq_worker::handler::_fetch_request(const hq_req_reader*& req, hq_res_sender*& res_sender)
+void hq_worker::handler::_start_worker_or_register(hq_worker* worker)
 {
   cac_mutex_t<junction>::lockref junction(junction_);
   
-  while (junction->reqs.empty()) {
-    pthread_cond_wait(&junction_cond_, junction_.mutex());
+  if (junction->reqs.empty()) {
+    junction->workers.push_back(worker);
+    return;
   }
-
-  req = junction->reqs.front().req;
-  res_sender = junction->reqs.front().res_sender;
+  req_queue_entry r(junction->reqs.front());
   junction->reqs.pop_front();
-  
-  return true;
+  worker->_start(r.req, r.res_sender);
 }
 
 hq_worker::hq_worker(int fd, const hq_req_reader&)
   : fd_(fd), req_(NULL), res_sender_(NULL), buf_()
 {
-  _start();
+  _prepare_next();
 }
 
 hq_worker::~hq_worker()
 {
   assert(req_ == NULL);
   assert(res_sender_ == NULL);
-  picoev_del(hq_loop::get_loop(), fd_);
+  if (picoev_is_active(hq_loop::get_loop(), fd_)) {
+    picoev_del(hq_loop::get_loop(), fd_);
+  }
   close(fd_);
 }
 
-void hq_worker::_start()
+void hq_worker::_prepare_next()
 {
-  // fetch entry from queue
-  while (! handler_._fetch_request(req_, res_sender_)) {
-  }
+  // fetch the request immediately or register myself to dispatcher
+  handler_._start_worker_or_register(this);
+}
+
+void hq_worker::_start(const hq_req_reader* req, hq_res_sender* res_sender)
+{
+  req_ = req;
+  res_sender_ = res_sender;
   
   // build request
   buf_.clear();
   buf_.push(req_->method());
   buf_.push(' ');
   buf_.push(req_->path());
-  buf_.push(' ');
-  buf_.push("HTTP/1.0");
+  buf_.push(" HTTP/1.0\r\n", sizeof(" HTTP/1.0\r\n") - 1);
   for (hq_headers::const_iterator i = req_->headers().begin();
        i != req_->headers().end();
        ++i) {
@@ -456,9 +473,7 @@ void hq_worker::_read_response_header(int fd, int revents)
   assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
   
   int status, minor_version, r;
-  const char* msg;
-  phr_header headers[MAX_HEADERS];
-  size_t msg_len, num_headers;
+  string msg;
   hq_headers hdrs;
   
  RETRY:
@@ -480,33 +495,37 @@ void hq_worker::_read_response_header(int fd, int revents)
   // read some bytes
   buf_.adjust_size(r);
 
-  // try to parse the response
-  num_headers = MAX_HEADERS;
-  r = phr_parse_response(buf_.buffer(), buf_.size(), &minor_version, &status,
-			 &msg, &msg_len, headers, &num_headers, 0);
-  if (r == -1) { // error
-    // TODO LOG
-    _return_error(500, "worker response error");
-    goto CLOSE;
-  } else if (r == -2) { // partial
-    return;
-  }
-  
-  // got response
-  for (size_t i = 0; i < num_headers; ++i) {
-    // TODO prune headers
-    hdrs.push_back(make_pair(string(headers[i].name,
-				    headers[i].name + headers[i].name_len),
-			     string(headers[i].value,
-				    headers[i].value + headers[i].value_len)));
+  { // try to parse the response
+    const char* msg_p;
+    phr_header headers[MAX_HEADERS];
+    size_t msg_len, num_headers = MAX_HEADERS;
+    r = phr_parse_response(buf_.buffer(), buf_.size(), &minor_version, &status,
+			   &msg_p, &msg_len, headers, &num_headers, 0);
+    if (r == -1) { // error
+      // TODO LOG
+      _return_error(500, "worker response error");
+      goto CLOSE;
+    } else if (r == -2) { // partial
+      return;
+    }
+    // got response
+    msg = string(msg_p, msg_len);
+    for (size_t i = 0; i < num_headers; ++i) {
+      // TODO prune headers
+      hdrs.push_back(make_pair(string(headers[i].name,
+				      headers[i].name + headers[i].name_len),
+			       string(headers[i].value,
+				      headers[i].value + headers[i].value_len)));
+    }
+    buf_.advance(r);
   }
   // TODO check content boundary, etc.
-  if (! res_sender_->open_response(status, string(msg, msg + msg_len), hdrs,
-				   buf_.buffer(), buf_.size())) {
+  if (! res_sender_->open_response(status, msg, hdrs, buf_.buffer(),
+				   buf_.size())) {
     // TODO LOG
     res_sender_ = NULL;
   }
-  buf_.advance(buf_.size());
+  buf_.clear();
   picoev_set_callback(hq_loop::get_loop(), fd_,
 		      hq_picoev_cb<hq_worker, &hq_worker::_read_response_body>,
 		      NULL);
