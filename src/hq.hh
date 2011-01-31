@@ -47,7 +47,15 @@ protected:
     }
   }
 };
-  
+
+class mutex_guard {
+protected:
+  pthread_mutex_t* m_;
+public:
+  mutex_guard(pthread_mutex_t* m) : m_(m) { pthread_mutex_lock(m); }
+  ~mutex_guard() { pthread_mutex_unlock(m_); }
+};
+
 /**
  * utility class for type-safe callback generation
  */
@@ -358,15 +366,41 @@ protected:
 public:
   static handler handler_;
 };
-  
-class hq_loop {
+
+class hq_listener {
+public:
+  class poll_guard {
+  protected:
+    bool locked_;
+  public:
+    poll_guard();
+    ~poll_guard();
+  };
+  friend class poll_guard;
 protected:
   int listen_fd_;
 public:
   /**
    * constructor
    */
-  hq_loop(int listen_fd);
+  hq_listener(int listen_fd);
+protected:
+  void _accept(int fd, int revents);
+private:
+  hq_listener(const hq_listener&); // not defined
+  ~hq_listener(); // TODO implement
+  hq_listener& operator=(const hq_listener&); // not defined
+protected:
+  static std::list<hq_listener*> listeners_;
+  static pthread_mutex_t listeners_mutex_;
+};
+
+class hq_loop {
+public:
+  /**
+   * constructor
+   */
+  hq_loop();
   /**
    * desctructor
    */
@@ -375,15 +409,13 @@ public:
    * main loop
    */
   void run_loop();
-protected:
-  void accept_conn(int fd, int revents);
 private:
   hq_loop(const hq_loop&); // not used
   hq_loop& operator=(const hq_loop&); // not used
 protected:
   static hq_tls<picoev_loop*> loop_;
 public:
-  static picoev_loop* get_loop();
+  static picoev_loop* get_loop() { return *loop_; }
 };
 
 class hq_util {

@@ -661,27 +661,42 @@ static void setup_sock(int fd)
   assert(r == 0);
 }
 
-hq_loop::hq_loop(int listen_fd)
-  : listen_fd_(listen_fd)
+hq_listener::poll_guard::poll_guard()
+  : locked_(false)
 {
-  *loop_ = picoev_create_loop(TIMEOUT_SECS);
-  picoev_add(*loop_, listen_fd_, PICOEV_READ, 0,
-	     hq_picoev_cb<hq_loop, &hq_loop::accept_conn>, this);
-}
-
-hq_loop::~hq_loop()
-{
-  picoev_destroy_loop(*loop_);
-}
-
-void hq_loop::run_loop()
-{
-  while (1) {
-    picoev_loop_once(*loop_, TIMEOUT_SECS);
+  if (pthread_mutex_trylock(&hq_listener::listeners_mutex_) != 0)
+    return;
+  // if the lock succeeded add the file descriptors to the poll list
+  locked_ = true;
+  for (list<hq_listener*>::iterator i = listeners_.begin();
+       i != listeners_.end();
+       ++i) {
+    picoev_add(hq_loop::get_loop(), (*i)->listen_fd_, PICOEV_READ, 0,
+	       hq_picoev_cb<hq_listener, &hq_listener::_accept>, *i);
   }
 }
 
-void hq_loop::accept_conn(int fd, int revents)
+hq_listener::poll_guard::~poll_guard()
+{
+  if (! locked_)
+    return;
+  // remove the descriptors from the poll list and unlock
+  for (list<hq_listener*>::iterator i = listeners_.begin();
+       i != listeners_.end();
+       ++i) {
+    picoev_del(hq_loop::get_loop(), (*i)->listen_fd_);
+  }
+  pthread_mutex_unlock(&hq_listener::listeners_mutex_);
+}
+
+hq_listener::hq_listener(int listen_fd)
+  : listen_fd_(listen_fd)
+{
+  mutex_guard mg(&listeners_mutex_);
+  listeners_.push_back(this);
+}
+
+void hq_listener::_accept(int fd, int revents)
 {
   assert(fd == listen_fd_);
   assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
@@ -694,12 +709,28 @@ void hq_loop::accept_conn(int fd, int revents)
   new hq_client(newfd);
 }
 
-hq_tls<picoev_loop*> hq_loop::loop_;
+std::list<hq_listener*> hq_listener::listeners_;
+pthread_mutex_t hq_listener::listeners_mutex_ = PTHREAD_MUTEX_INITIALIZER;
 
-picoev_loop* hq_loop::get_loop()
+hq_loop::hq_loop()
 {
-  return *loop_;
+  *loop_ = picoev_create_loop(TIMEOUT_SECS);
 }
+
+hq_loop::~hq_loop()
+{
+  picoev_destroy_loop(*loop_);
+}
+
+void hq_loop::run_loop()
+{
+  while (1) {
+    hq_listener::poll_guard pg;
+    picoev_loop_once(*loop_, TIMEOUT_SECS);
+  }
+}
+
+hq_tls<picoev_loop*> hq_loop::loop_;
 
 hq_headers::const_iterator hq_util::find_header(const hq_headers& hdrs, const string& name)
 {
@@ -743,7 +774,9 @@ int main(int argc, char** argv)
   
   picoev_init(MAX_FDS);
   
-  hq_loop loop(listen_fd);
+  new hq_listener(listen_fd);
+  
+  hq_loop loop;
   loop.run_loop();
   
   return 0;
