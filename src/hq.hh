@@ -229,6 +229,11 @@ public:
    * closes the response
    */
   virtual void close_response() = 0;
+protected:
+  /**
+   * destructor, only called from the dtor of derived classes
+   */
+  ~hq_res_sender() {}
 };
 
 /**
