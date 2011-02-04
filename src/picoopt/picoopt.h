@@ -1,6 +1,27 @@
 #ifndef PICOOPT_H
 #define PICOOPT_H
 
+/**
+ * HOWTO: derive your configurator from config_base<your_configurator>
+ * and the configurator will be automatically registered.
+ * 
+ * EXAMPLE:
+ * 
+ * class my_config : public picoopt::config_base<my_config> {
+ * public:
+ *   my_config()
+ *     : picoopt::config_base<my_config>(
+ *         "my-config",         // name of my option (passed to getopt_long)
+ *         required_argument    // passed to getopt_long
+ *     ) {}
+ *   virtual int setup(const char* optval, std::string& err) {
+ *     ...
+ *     return 0; // success
+ *   }
+ * };
+ *
+ */
+
 extern "C" {
 #include <getopt.h>
 }
