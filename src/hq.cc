@@ -1,6 +1,7 @@
 extern "C" {
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -734,47 +735,78 @@ hq_tls<picoev_loop*> hq_loop::loop_;
 
 hq_headers::const_iterator hq_util::find_header(const hq_headers& hdrs, const string& name)
 {
-  hq_headers::const_iterator i = hdrs.begin();
-  if (i != hdrs.end()) {
-    do {
-      if (i->first.size() != name.size()) {
-	goto NOT_EQUAL;
+  hq_headers::const_iterator i;
+  for (i= hdrs.begin(); i != hdrs.end(); ++i) {
+    if (i->first.size() != name.size()) {
+      goto NEXT;
+    }
+    for (size_t j = 0; j < name.size(); ++j) {
+      if (tolower(i->first[j]) != tolower(name[j])) {
+	goto NEXT;
       }
-      for (size_t j = 0; j < name.size(); ++j) {
-	if (tolower(i->first[j]) != tolower(name[j])) {
-	  goto NOT_EQUAL;
-	}
-      }
-      break;
-    NOT_EQUAL:
-      ;
-    } while (++i != hdrs.end());
+    }
+    // equals
+    break;
+  NEXT:
+    ;
   }
   return i;
 }
 
-int main(int argc, char** argv)
+static bool setup_port(const char* hostport)
 {
-  int listen_fd, flag, r;
-  
-  listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-  assert(listen_fd != -1);
-  flag = 1;
-  r = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+  unsigned short port;
+  if (sscanf(hostport, "%hu", &port) != 1) {
+    fprintf(stderr, "invalid argument: --port=# not a number\n");
+    return false;
+  }
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  assert(fd != -1);
+  int r, flag = 1;
+  r = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
   assert(r == 0);
   struct sockaddr_in sa;
   sa.sin_family = AF_INET;
-  sa.sin_port = htons(10987);
+  sa.sin_port = htons(port);
   sa.sin_addr.s_addr = htonl(0);
-  r = bind(listen_fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+  if (bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+    fprintf(stderr, "failed to bind to port: %u\n", (unsigned)port);
+    return false;
+  }
+  setup_sock(fd);
+  r = listen(fd, SOMAXCONN);
   assert(r == 0);
-  setup_sock(listen_fd);
-  r = listen(listen_fd, SOMAXCONN);
-  assert(r == 0);
-  
+  new hq_listener(fd);
+  return true;
+}
+
+int main(int argc, char** argv)
+{
   picoev_init(MAX_FDS);
   
-  new hq_listener(listen_fd);
+  static struct option long_options[] = {
+    { "port", required_argument, NULL, 0 },
+    { NULL,   0,                 NULL, 0 },
+  };
+  bool had_port = false;
+  int opt_index;
+  while (getopt_long(argc, argv, "", long_options, &opt_index) != -1) {
+    switch (opt_index) {
+    case 0: /* port=%s */
+      if (! setup_port(optarg)) {
+	exit(1);
+      }
+      had_port = true;
+      break;
+    default:
+      assert(0);
+      break;
+    }
+  }
+  if (! had_port) {
+    fprintf(stderr, "required argument: --port=# is missing\n");
+    exit(1);
+  }
   
   hq_loop loop;
   loop.run_loop();
