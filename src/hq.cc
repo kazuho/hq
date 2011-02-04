@@ -158,11 +158,17 @@ bool hq_req_reader::_read_content(int fd)
   return true;
 }
 
+list<hq_handler*> hq_handler::handlers_;
+
 void hq_handler::dispatch_request(const hq_req_reader& req, hq_res_sender* res_sender)
 {
-  // TODO should be configurable and support other handlers (like static content) as well
-  if (hq_worker::handler_.dispatch(req, res_sender)) {
-    return;
+  for (list<hq_handler*>::iterator i = handlers_.begin();
+       i != handlers_.end();
+       ++i) {
+    hq_handler* handler = *i;
+    if (handler->dispatch(req, res_sender)) {
+      return;
+    }
   }
   send_error(req, res_sender, 500, "no handler");
 }
@@ -653,6 +659,11 @@ void hq_worker::_return_error(int status, const string& msg)
 
 hq_worker::handler hq_worker::handler_;
 
+void hq_worker::setup()
+{
+  hq_handler::handlers_.push_back(&handler_);
+}
+
 static void setup_sock(int fd)
 {
   int on = 1, r;
@@ -660,6 +671,50 @@ static void setup_sock(int fd)
   assert(r == 0);
   r = fcntl(fd, F_SETFL, O_NONBLOCK);
   assert(r == 0);
+}
+
+hq_listener::config::config()
+  : picoopt::config_base<config>("port", required_argument),
+    called_cnt_(0)
+{
+}
+
+int hq_listener::config::setup(const char* hostport, string& err)
+{
+  unsigned short port;
+  if (sscanf(hostport, "%hu", &port) != 1) {
+    err = "port should be a number";
+    return 1;
+  }
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  assert(fd != -1);
+  int r, flag = 1;
+  r = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+  assert(r == 0);
+  struct sockaddr_in sa;
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(port);
+  sa.sin_addr.s_addr = htonl(0);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+    err = "failed to bind to port";
+    return 1;
+  }
+  setup_sock(fd);
+  r = listen(fd, SOMAXCONN);
+  assert(r == 0);
+  new hq_listener(fd);
+  
+  called_cnt_++;
+  return 0;
+}
+
+int hq_listener::config::post_setup(string& err)
+{
+  if (called_cnt_ < 1) {
+    err = "should be set more than once";
+    return 1;
+  }
+  return 0;
 }
 
 hq_listener::poll_guard::poll_guard()
@@ -733,6 +788,66 @@ void hq_loop::run_loop()
 
 hq_tls<picoev_loop*> hq_loop::loop_;
 
+hq_static_handler::config::config()
+  : picoopt::config_base<config>("static", required_argument)
+{
+}
+
+int hq_static_handler::config::setup(const char* mapping, string& err)
+{
+  const char* eq = strchr(mapping, '=');
+  if (eq == NULL) {
+    err = "not like: virtual_path=real_path";
+    return 1;
+  }
+  
+  string vpath(mapping, eq), dir(eq + 1);
+  if (! vpath.empty() && *vpath.rbegin() != '/') {
+    vpath.push_back('/');
+  }
+  if (! dir.empty() && *vpath.rbegin() != '/') {
+    dir.push_back('/');
+  }
+  
+  hq_handler::handlers_.push_back(new hq_static_handler(vpath, dir));
+  return 0;
+}
+
+bool hq_static_handler::dispatch(const hq_req_reader& req, hq_res_sender* res_sender)
+{
+  if (req.path().compare(0, vpath_.size(), vpath_) != 0) {
+    return false;
+  }
+  if (*req.path().rbegin() == '/') {
+    // TODO LOG
+    send_error(req, res_sender, 403, "directory listing not supported");
+    return true;
+  }
+  
+  string realpath(vpath_ + req.path().substr(vpath_.size()));
+  int fd;
+  if (open(realpath.c_str(), O_RDONLY) == -1) {
+    switch (errno) {
+    case EEXIST:
+      // TODO LOG
+      send_error(req, res_sender, 404, "not found");
+      break;
+    default:
+      // TODO LOG
+      send_error(req, res_sender, 403, "access denied");
+      break;
+    }
+    return true;
+  }
+  
+  string mime_type(hq_util::get_mime_type(hq_util::get_ext(realpath)));
+  hq_headers hdrs;
+  hdrs.push_back(hq_headers::value_type("Content-Type", mime_type));
+  res_sender->send_file_response(200, "OK", hdrs, fd);
+  
+  return true;
+}
+
 hq_headers::const_iterator hq_util::find_header(const hq_headers& hdrs, const string& name)
 {
   hq_headers::const_iterator i;
@@ -753,60 +868,48 @@ hq_headers::const_iterator hq_util::find_header(const hq_headers& hdrs, const st
   return i;
 }
 
-static bool setup_port(const char* hostport)
+string hq_util::get_mime_type(const string& ext)
 {
-  unsigned short port;
-  if (sscanf(hostport, "%hu", &port) != 1) {
-    fprintf(stderr, "invalid argument: --port=# not a number\n");
-    return false;
+#define MAP(e, m) if (ext == e) return m
+  MAP("htm", "text/html");
+  MAP("html", "text/html");
+  MAP("gif", "image/gif");
+  MAP("jpg", "image/jpeg");
+  MAP("jpeg", "image/jpeg");
+  MAP("png", "image/png");
+#undef MAP
+  return "text/plain";
+}
+
+string hq_util::get_ext(const string& path)
+{
+  string::const_iterator i = path.end();
+  if (i != path.begin()) {
+    do {
+      --i;
+      switch (*i) {
+      case '.':
+	return string(i + 1, path.end());
+      case '/':
+	break;
+      }
+    } while (i != path.begin());
   }
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  assert(fd != -1);
-  int r, flag = 1;
-  r = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
-  assert(r == 0);
-  struct sockaddr_in sa;
-  sa.sin_family = AF_INET;
-  sa.sin_port = htons(port);
-  sa.sin_addr.s_addr = htonl(0);
-  if (bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-    fprintf(stderr, "failed to bind to port: %u\n", (unsigned)port);
-    return false;
-  }
-  setup_sock(fd);
-  r = listen(fd, SOMAXCONN);
-  assert(r == 0);
-  new hq_listener(fd);
-  return true;
+  return string();
 }
 
 int main(int argc, char** argv)
 {
   picoev_init(MAX_FDS);
   
-  static struct option long_options[] = {
-    { "port", required_argument, NULL, 0 },
-    { NULL,   0,                 NULL, 0 },
-  };
-  bool had_port = false;
-  int opt_index;
-  while (getopt_long(argc, argv, "", long_options, &opt_index) != -1) {
-    switch (opt_index) {
-    case 0: /* port=%s */
-      if (! setup_port(optarg)) {
-	exit(1);
-      }
-      had_port = true;
-      break;
-    default:
-      assert(0);
-      break;
-    }
+  int r;
+  if ((r = picoopt::parse_args(argc, argv)) != 0) {
+    exit(r);
   }
-  if (! had_port) {
-    fprintf(stderr, "required argument: --port=# is missing\n");
-    exit(1);
-  }
+  argc -= optind;
+  argv += optind;
+  
+  hq_worker::setup();
   
   hq_loop loop;
   loop.run_loop();

@@ -14,6 +14,7 @@ extern "C" {
 #include "picoev/picoev.h"
 }
 #include "cac/cac_mutex.h"
+#include "picoopt/picoopt.h"
 
 /**
  * utility class for tls
@@ -251,6 +252,8 @@ public:
    */
   virtual bool dispatch(const hq_req_reader& req, hq_res_sender* res_sender) = 0;
 public:
+  static std::list<hq_handler*> handlers_;
+public:
   /**
    * dispatches a request
    */
@@ -368,12 +371,22 @@ protected:
   void _read_response_header(int fd, int revents);
   void _read_response_body(int fd, int revents);
   void _return_error(int status, const std::string& msg);
-public:
+protected:
   static handler handler_;
+public:
+  static void setup();
 };
 
 class hq_listener {
 public:
+  class config : public picoopt::config_base<config> {
+  protected:
+    size_t called_cnt_;
+  public:
+    config();
+    virtual int setup(const char* hostport, std::string& err);
+    virtual int post_setup(std::string& err);
+  };
   class poll_guard {
   protected:
     bool locked_;
@@ -384,12 +397,8 @@ public:
   friend class poll_guard;
 protected:
   int listen_fd_;
-public:
-  /**
-   * constructor
-   */
-  hq_listener(int listen_fd);
 protected:
+  hq_listener(int listen_fd);
   void _accept(int fd, int revents);
 private:
   hq_listener(const hq_listener&); // not defined
@@ -423,9 +432,38 @@ public:
   static picoev_loop* get_loop() { return *loop_; }
 };
 
+class hq_static_handler : public hq_handler {
+public:
+  class config : public picoopt::config_base<config> {
+  public:
+    config();
+    virtual int setup(const char* mapping, std::string& err);
+  };
+protected:
+  std::string vpath_; // with trailing slash
+  std::string dir_; // with trailing slash
+public:
+  /**
+   * destructor
+   */
+  ~hq_static_handler() {}
+  /**
+   * dispatches a request
+   */
+  virtual bool dispatch(const hq_req_reader& req, hq_res_sender* res_sender);
+protected:
+  hq_static_handler(const std::string& vpath, const std::string& dir)
+    : vpath_(vpath), dir_(dir) {}
+private:
+  hq_static_handler(const hq_static_handler&); // not defined
+  hq_static_handler& operator=(const hq_static_handler&); // not defined
+};
+
 class hq_util {
 public:
   static hq_headers::const_iterator find_header(const hq_headers& hdrs, const std::string& name);
+  static std::string get_mime_type(const std::string& ext);
+  static std::string get_ext(const std::string& path);
 };
 
 #endif

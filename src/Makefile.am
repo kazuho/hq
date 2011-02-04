@@ -1,5 +1,5 @@
 bin_PROGRAMS=	hq
-hq_SOURCES=	hq.cc picohttpparser/picohttpparser.c
+hq_SOURCES=	hq.cc picohttpparser/picohttpparser.c picoopt/picoopt.cc
 if PICOEV_USE_KQUEUE
 hq_SOURCES+=	picoev/picoev_kqueue.c
 else
