@@ -368,7 +368,7 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
 #elif HQ_IS_BSD
   {
     off_t len = 1048576;
-    if ((r = sendfile(fd_, res_.sendfile.fd, res_.sendfile.pos, &len, NULL, 0))
+    if ((r = sendfile(res_.sendfile.fd, fd_, res_.sendfile.pos, &len, NULL, 0))
 	== 0) {
       res_.sendfile.pos += len;
     }
@@ -383,7 +383,7 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
     }
   } else if (errno == EINTR) {
     goto RETRY;
-  } else if (! (errno == EAGAIN || EWOULDBLOCK)) {
+  } else if (! (errno == EAGAIN || errno == EWOULDBLOCK)) {
     picolog::error() << hq_gethostof(fd) << " sendfile(2) failed while sending response, errno:" << errno;
     goto ON_CLOSE;
   }
@@ -834,7 +834,7 @@ int hq_static_handler::config::setup(const char* mapping, string& err)
   if (! vpath.empty() && *vpath.rbegin() != '/') {
     vpath.push_back('/');
   }
-  if (! dir.empty() && *vpath.rbegin() != '/') {
+  if (! dir.empty() && *dir.rbegin() != '/') {
     dir.push_back('/');
   }
   
@@ -851,15 +851,18 @@ bool hq_static_handler::dispatch(const hq_req_reader& req, hq_res_sender* res_se
     send_error(req, res_sender, 403, "directory listing not supported");
     return true;
   }
-  
-  string realpath(vpath_ + req.path().substr(vpath_.size()));
+
+  string realpath(dir_ + req.path().substr(vpath_.size()));
   int fd;
-  if (open(realpath.c_str(), O_RDONLY) == -1) {
+  if ((fd = open(realpath.c_str(), O_RDONLY)) == -1) {
     switch (errno) {
     case EEXIST:
+      picolog::error() << "file not found: " << realpath;
       send_error(req, res_sender, 404, "not found");
       break;
     default:
+      picolog::error() << "access denied to: " << realpath << ", errno:"
+		       << errno;
       send_error(req, res_sender, 403, "access denied");
       break;
     }
