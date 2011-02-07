@@ -160,6 +160,15 @@ private:
   hq_buffer& operator=(const hq_buffer&); // not used
 };
 
+class hq_gethostof {
+protected:
+  int fd_;
+public:
+  hq_gethostof(int fd) : fd_(fd) {}
+  std::string str() const;
+  friend std::ostream& operator<<(std::ostream& os, const hq_gethostof& self) { return os << self.str(); }
+};
+
 /**
  * reads a HTTP request
  */

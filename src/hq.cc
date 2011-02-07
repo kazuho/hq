@@ -1,4 +1,5 @@
 extern "C" {
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -16,6 +17,7 @@ extern "C" {
 extern "C" {
 #include "picohttpparser/picohttpparser.h"
 }
+#include "picolog/picolog.h"
 #include "hq.hh"
 
 #define MAX_FDS 1024
@@ -24,6 +26,22 @@ extern "C" {
 #define TIMEOUT_SECS 60
 
 using namespace std;
+
+string hq_gethostof::str() const
+{
+  sockaddr_in sin;
+  socklen_t slen = sizeof(sin);
+  if (getpeername(fd_, (sockaddr*)&sin, &slen) == 0
+      && sin.sin_family == AF_INET) {
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    mutex_guard g(&m);
+    return inet_ntoa(sin.sin_addr);
+  } else {
+    char buf[32];
+    sprintf(buf, "fd=%d", fd_);
+    return buf;
+  }
+}
 
 hq_req_reader::hq_req_reader()
   : buf_(), method_(), path_(), headers_(), content_(NULL),
@@ -58,7 +76,8 @@ hq_req_reader::_read_request(int fd)
  RETRY:
   if ((r = read(fd, buf_.prepare(READ_MAX), READ_MAX)) == 0) {
     // closed by peer
-    // TODO LOG
+    picolog::info() << hq_gethostof(fd)
+		    << " closed by peer while reading the request";
     return false;
   } else if (r == -1) { // error
     if (errno == EINTR) {
@@ -66,7 +85,8 @@ hq_req_reader::_read_request(int fd)
     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return true;
     } else {
-      // TODO log error
+      picolog::error() << hq_gethostof(fd) << " closing due to I/O error "
+		       << errno;
       return false;
     }
   }
@@ -81,7 +101,8 @@ hq_req_reader::_read_request(int fd)
     r = phr_parse_request(buf_.buffer(), buf_.size(), &method, &method_len,
 			  &path, &path_len, &minor_version, hdrs, &num_hdrs, 0);
     if (r == -1) { // error
-      // TODO LOG
+      picolog::info() << hq_gethostof(fd)
+		      << " got a corrupt HTTP request, closing";
       return false;
     } else if (r == -2) { // partial
       return true;
@@ -114,7 +135,8 @@ hq_req_reader::_read_request(int fd)
   }
   // have content-length
   if (sscanf("%llu", clen_iter->second.c_str(), &content_length_) != 1) {
-    // TODO LOG
+    picolog::error() << hq_gethostof(fd)
+		     << " got an invalid content-length header, closing";
     return false;
   }
   content_ = new hq_buffer();
@@ -138,7 +160,8 @@ bool hq_req_reader::_read_content(int fd)
  RETRY:
   if ((r = read(fd, content_->prepare(maxlen), maxlen)) == 0) {
     // closed by peer
-    // TODO LOG
+    picolog::error() << hq_gethostof(fd)
+		     << " closed by peer while reading the request content";
     return false;
   } else if (r == -1) { // error
     if (errno == EINTR) {
@@ -146,7 +169,8 @@ bool hq_req_reader::_read_content(int fd)
     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return true;
     } else {
-      // TODO LOG
+      picolog::error() << hq_gethostof(fd) << " closing due to I/O error "
+		       << errno;
       return false;
     }
   }
@@ -223,7 +247,7 @@ void hq_client::_read_request(int fd, int revents)
   if (req_.method() == "START_WORKER") {
     int newfd = dup(fd_);
     if (newfd == -1) {
-      // TODO LOG
+      picolog::error() << "dup(2) failed due to error " << errno;
       hq_handler::send_error(req_, this, 500, "dup failure");
       return;
     }
@@ -360,7 +384,7 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
   } else if (errno == EINTR) {
     goto RETRY;
   } else if (! (errno == EAGAIN || EWOULDBLOCK)) {
-    // TODO LOG
+    picolog::error() << hq_gethostof(fd) << " sendfile(2) failed while sending response, errno:" << errno;
     goto ON_CLOSE;
   }
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
@@ -393,7 +417,7 @@ bool hq_client::_write_sendbuf(bool disactivate_poll_when_empty)
   } else if (errno == EINTR) {
     goto RETRY;
   } else if (! (errno == EINTR || errno == EWOULDBLOCK)) {
-    // TODO LOG
+    picolog::error() << hq_gethostof(fd_) << " write(2) failed while sending response, errno:" << errno;
     goto ON_CLOSE;
   }
   picoev_set_events(hq_loop::get_loop(), fd_,
