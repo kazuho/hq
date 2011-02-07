@@ -89,7 +89,7 @@ void picoopt::push_longopts(const char* name, int has_arg)
 {
   longopts().push_back(option());
   longopts().back().name = name;
-  longopts().back().has_arg = 0;
+  longopts().back().has_arg = has_arg;
   longopts().back().flag = NULL;
   longopts().back().val = 0;
 }
