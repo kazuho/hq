@@ -102,7 +102,7 @@ hq_req_reader::_read_request(int fd)
 			  &path, &path_len, &minor_version, hdrs, &num_hdrs, 0);
     if (r == -1) { // error
       picolog::info() << hq_gethostof(fd)
-		      << " got a corrupt HTTP request, closing";
+		      << " received a broken HTTP request";
       return false;
     } else if (r == -2) { // partial
       return true;
@@ -574,7 +574,7 @@ void hq_worker::_read_response_header(int fd, int revents)
  RETRY:
   if ((r = read(fd_, buf_.prepare(READ_MAX), READ_MAX)) == 0) {
     // closed
-    // TODO LOG
+    picolog::error() << hq_gethostof(fd) << " worker closed the connection";
     _return_error(500, "connection closed by worker");
     goto CLOSE;
   } else if (r == -1) {
@@ -583,6 +583,9 @@ void hq_worker::_read_response_header(int fd, int revents)
     } else if (r == EAGAIN || r == EWOULDBLOCK) {
       return;
     } else {
+      picolog::error() << hq_gethostof(fd)
+		       << " failed to read response from worker, errno:"
+		       << errno;
       _return_error(500, "worker connection error");
       goto CLOSE;
     }
@@ -597,7 +600,8 @@ void hq_worker::_read_response_header(int fd, int revents)
     r = phr_parse_response(buf_.buffer(), buf_.size(), &minor_version, &status,
 			   &msg_p, &msg_len, headers, &num_headers, 0);
     if (r == -1) { // error
-      // TODO LOG
+      picolog::error() << hq_gethostof(fd)
+		       << " received a broken HTTP request";
       _return_error(500, "worker response error");
       goto CLOSE;
     } else if (r == -2) { // partial
@@ -617,7 +621,6 @@ void hq_worker::_read_response_header(int fd, int revents)
   // TODO check content boundary, etc.
   if (! res_sender_->open_response(status, msg, hdrs, buf_.buffer(),
 				   buf_.size())) {
-    // TODO LOG
     res_sender_ = NULL;
   }
   buf_.clear();
@@ -641,7 +644,6 @@ void hq_worker::_read_response_body(int fd, int revents)
  RETRY:
   if ((r = read(fd_, buf, READ_MAX)) == 0) {
     // closed
-    // TODO LOG
     goto CLOSE;
   } else if (r == -1) {
     if (r == EINTR) {
@@ -649,14 +651,15 @@ void hq_worker::_read_response_body(int fd, int revents)
     } else if (r == EAGAIN || r == EWOULDBLOCK) {
       return;
     } else {
-      // TODO LOG
+      picolog::error() << hq_gethostof(fd)
+		       << " failed to read response content from worker, errno:"
+		       << errno;
       goto CLOSE;
     }
   }
   // got data
   if (res_sender_ != NULL) {
     if (! res_sender_->send_response(buf, r)) {
-      // TODO LOG
       res_sender_ = NULL;
     }
   }
@@ -843,7 +846,6 @@ bool hq_static_handler::dispatch(const hq_req_reader& req, hq_res_sender* res_se
     return false;
   }
   if (*req.path().rbegin() == '/') {
-    // TODO LOG
     send_error(req, res_sender, 403, "directory listing not supported");
     return true;
   }
@@ -853,11 +855,9 @@ bool hq_static_handler::dispatch(const hq_req_reader& req, hq_res_sender* res_se
   if (open(realpath.c_str(), O_RDONLY) == -1) {
     switch (errno) {
     case EEXIST:
-      // TODO LOG
       send_error(req, res_sender, 404, "not found");
       break;
     default:
-      // TODO LOG
       send_error(req, res_sender, 403, "access denied");
       break;
     }
