@@ -23,7 +23,7 @@ public:
     INFO,
     WARN,
     ERROR,
-    NUM_LEVELS,
+    NUM_LEVELS
   };
   
 protected:
