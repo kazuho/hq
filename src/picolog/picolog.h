@@ -1,3 +1,16 @@
+/**
+ * very simple logger
+ *
+ * Usage:
+ *   picolog::debug() << "this is debug level";
+ *   picolog::info() << "this is info level";
+ *   picolog::warn() << "this is warn level";
+ *   picolog::error() << "this is error level";
+ *   picolog::crit() << "this is crit level";
+ * 
+ * To change the destination, call picolog::set_fd(level, fd).  By default, >=warn goes to stderr and <=info are disgarded.
+ */
+
 #ifndef PICOLOG_H
 #define PICOLOG_H
 
