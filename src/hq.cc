@@ -701,7 +701,8 @@ static void setup_sock(int fd)
 }
 
 hq_listener::config::config()
-  : picoopt::config_base<config>("port", required_argument),
+  : picoopt::config_base<config>("port", required_argument,
+				 "=[host:]port"),
     called_cnt_(0)
 {
 }
@@ -816,7 +817,8 @@ void hq_loop::run_loop()
 hq_tls<picoev_loop*> hq_loop::loop_;
 
 hq_static_handler::config::config()
-  : picoopt::config_base<config>("static", required_argument)
+  : picoopt::config_base<config>("static", required_argument,
+				 "=virtual_path=static_path")
 {
 }
 
@@ -921,6 +923,16 @@ string hq_util::get_ext(const string& path)
   }
   return string();
 }
+
+struct hq_help : public picoopt::config_base<hq_help> {
+  hq_help()
+    : picoopt::config_base<hq_help>("help", no_argument, "  print this help")
+  {}
+  virtual int setup(const char*, std::string&) {
+    picoopt::print_help(stdout, "HQ - a queue-based HTTP server");
+    exit(0);
+  }
+};
 
 int main(int argc, char** argv)
 {
