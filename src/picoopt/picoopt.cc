@@ -34,8 +34,10 @@ int picoopt::parse_args(int argc, char** argv)
     switch (ch) {
     default:
       {
+	string arg(optarg != NULL ? optarg : "");
 	string err;
-	if ((ret = configs()[index]->setup(optarg, err)) != 0) {
+	if ((ret = configs()[index]->setup(optarg != NULL ? &arg : NULL, err))
+	    != 0) {
 	fprintf(stderr, "option --%s: %s\n", longopts()[index].name,
 		err.c_str());
 	return ret;

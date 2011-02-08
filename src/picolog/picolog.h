@@ -68,7 +68,7 @@ private:
   void _init(int level);
   void _flush();
 public:
-  static const char* level_labels[];
+  static const std::string level_labels[];
 protected:
   static int fd_;
   static int log_level_;

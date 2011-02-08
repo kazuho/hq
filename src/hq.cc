@@ -199,6 +199,7 @@ void hq_handler::send_error(const hq_req_reader& req, hq_res_sender* res_sender,
 hq_client::hq_client(int fd)
   : fd_(fd), req_()
 {
+  picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
   _start();
 }
 
@@ -213,9 +214,9 @@ hq_client::~hq_client()
 void hq_client::_start()
 {
   res_.status = 0;
-  
-  picoev_add(hq_loop::get_loop(), fd_, PICOEV_READ, 0,
-	     hq_picoev_cb<hq_client, &hq_client::_read_request>, this);
+  picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_READ);
+  picoev_set_callback(hq_loop::get_loop(), fd_,
+		      hq_picoev_cb<hq_client, &hq_client::_read_request>, NULL);
 }
 
 void hq_client::_read_request(int fd, int revents)
@@ -231,8 +232,6 @@ void hq_client::_read_request(int fd, int revents)
   if (! req_.is_complete()) {
     return;
   }
-  // request is complete, remove from event listener
-  picoev_del(hq_loop::get_loop(), fd_);
   // if the connection is a worker, then...
   if (req_.method() == "START_WORKER") {
     int newfd = dup(fd_);
@@ -246,13 +245,13 @@ void hq_client::_read_request(int fd, int revents)
     return;
   }
   // is a client
+  picoev_del(hq_loop::get_loop(), fd_);
   hq_handler::dispatch_request(req_, this);
 }
 
 void hq_client::send_file_response(int status, const string& msg, const hq_headers& headers, int fd)
 {
   _prepare_response(status, msg, headers, fd);
-  
   _write_sendfile_cb(fd_, PICOEV_WRITE);
 }
 
@@ -264,7 +263,6 @@ bool hq_client::open_response(int status, const string& msg, const hq_headers& h
   if (len != 0) {
     res_.sendbuf.push(data, len);
   }
-  
   return _write_sendbuf(true);
 }
 
@@ -284,8 +282,7 @@ void hq_client::close_response()
 
 void hq_client::_prepare_response(int status, const string& msg, const hq_headers& headers, const int sendfile_fd)
 {
-  picoev_add(hq_loop::get_loop(), fd_, 0, 0,
-	     hq_picoev_cb<hq_client, &hq_client::_write_sendbuf_cb>, this);
+  picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
   
   res_.status = status;
   res_.sendbuf.clear();
@@ -297,16 +294,22 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
     int r = fstat(res_.sendfile.fd, &st);
     assert(r == 0); // fstat error is really fatal
     res_.sendfile.size = st.st_size;
+    picoev_set_callback(hq_loop::get_loop(), fd_,
+			hq_picoev_cb<hq_client, &hq_client::_write_sendfile_cb>,
+			NULL);
   } else {
     res_.closed_by_sender = false;
     res_.sendfile.fd = -1;
     res_.sendfile.pos = 0;
     res_.sendfile.size = 0;
+    picoev_set_callback(hq_loop::get_loop(), fd_,
+			hq_picoev_cb<hq_client, &hq_client::_write_sendbuf_cb>,
+			NULL);
   }
   
   // TODO support for keep-alive and HTTP/1.1
   {
-    char buf[sizeof("HTTP/1.0 -1234567890 ")];
+    char buf[sizeof("HTTP/1.1 -1234567890 ")];
     sprintf(buf, "HTTP/1.1 %d ", status);
     res_.sendbuf.push(buf, strlen(buf));
   }
@@ -362,9 +365,9 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
   r = sendfile(fd_, res_.sendfile.fd, &res_.sendfile.pos, 1048576);
 #elif HQ_IS_BSD
   {
-    off_t len = 1048576;
-    if ((r = sendfile(res_.sendfile.fd, fd_, res_.sendfile.pos, &len, NULL, 0))
-	== 0) {
+    off_t len = min((off_t)1048576, res_.sendfile.size);
+    r = sendfile(res_.sendfile.fd, fd_, res_.sendfile.pos, &len, NULL, 0);
+    if (r == 0 || errno == EAGAIN) {
       res_.sendfile.pos += len;
     }
   }
@@ -475,6 +478,7 @@ void hq_worker::handler::_start_worker_or_register(hq_worker* worker)
 hq_worker::hq_worker(int fd, const hq_req_reader&)
   : fd_(fd), req_(NULL), res_sender_(NULL), buf_()
 {
+  picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
   buf_.push("HTTP/1.1 101 Upgrade\r\n"
 	    "Upgrade: HTTPWORKER/0.9\r\n\r\n");
   _send_upgrade(fd, PICOEV_WRITE);
@@ -484,9 +488,7 @@ hq_worker::~hq_worker()
 {
   assert(req_ == NULL);
   assert(res_sender_ == NULL);
-  if (picoev_is_active(hq_loop::get_loop(), fd_)) {
-    picoev_del(hq_loop::get_loop(), fd_);
-  }
+  picoev_del(hq_loop::get_loop(), fd_);
   close(fd_);
 }
 
@@ -502,10 +504,10 @@ void hq_worker::_send_upgrade(int fd, int revents)
     delete this;
   }
   if (! buf_.empty()) {
-    if (! picoev_is_active(hq_loop::get_loop(), fd_)) {
-      picoev_add(hq_loop::get_loop(), fd_, PICOEV_WRITE, 0,
-		 hq_picoev_cb<hq_worker, &hq_worker::_send_upgrade>, this);
-    }
+    picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
+    picoev_set_callback(hq_loop::get_loop(), fd_,
+			hq_picoev_cb<hq_worker, &hq_worker::_send_upgrade>,
+			NULL);
   } else {
     _prepare_next();
   }
@@ -513,9 +515,7 @@ void hq_worker::_send_upgrade(int fd, int revents)
 
 void hq_worker::_prepare_next()
 {
-  if (picoev_is_active(hq_loop::get_loop(), fd_)) {
-    picoev_del(hq_loop::get_loop(), fd_);
-  }
+  picoev_set_events(hq_loop::get_loop(), fd_, 0);
   // fetch the request immediately or register myself to dispatcher
   handler_._start_worker_or_register(this);
 }
@@ -542,8 +542,6 @@ void hq_worker::_start(const hq_req_reader* req, hq_res_sender* res_sender)
   }
   buf_.push("\r\n", 2);
   
-  picoev_add(hq_loop::get_loop(), fd_, PICOEV_WRITE, 0,
-	     hq_picoev_cb<hq_worker, &hq_worker::_send_request_cb>, this);
   _send_request();
 }
 
@@ -562,12 +560,17 @@ void hq_worker::_send_request()
     goto CLOSE;
   }
   if (! buf_.empty()) {
+    picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
+    picoev_set_callback(hq_loop::get_loop(), fd_,
+			hq_picoev_cb<hq_worker, &hq_worker::_send_request_cb>,
+			NULL);
     return;
   }
   // sent all data, wait for response
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_READ);
   picoev_set_callback(hq_loop::get_loop(), fd_,
-		      hq_picoev_cb<hq_worker,&hq_worker::_read_response_header>,
+		      hq_picoev_cb<hq_worker,
+		                   &hq_worker::_read_response_header>,
 		      NULL);
   buf_.clear();
   return;
@@ -741,10 +744,10 @@ hq_listener::config::config()
 {
 }
 
-int hq_listener::config::setup(const char* hostport, string& err)
+int hq_listener::config::setup(const string* hostport, string& err)
 {
   unsigned short port;
-  if (sscanf(hostport, "%hu", &port) != 1) {
+  if (sscanf(hostport->c_str(), "%hu", &port) != 1) {
     err = "port should be a number";
     return 1;
   }
@@ -856,15 +859,15 @@ hq_static_handler::config::config()
 {
 }
 
-int hq_static_handler::config::setup(const char* mapping, string& err)
+int hq_static_handler::config::setup(const string* mapping, string& err)
 {
-  const char* eq = strchr(mapping, '=');
-  if (eq == NULL) {
+  string::size_type eq_at = mapping->find('=');
+  if (eq_at == string::npos) {
     err = "not like: virtual_path=real_path";
     return 1;
   }
   
-  string vpath(mapping, eq), dir(eq + 1);
+  string vpath(mapping->substr(0, eq_at)), dir(mapping->substr(eq_at + 1));
   if (! vpath.empty() && *vpath.rbegin() != '/') {
     vpath.push_back('/');
   }
@@ -911,15 +914,15 @@ bool hq_static_handler::dispatch(const hq_req_reader& req, hq_res_sender* res_se
   return true;
 }
 
-int hq_log_access::config::setup(const char* filename, string& err)
+int hq_log_access::config::setup(const string* filename, string& err)
 {
   if (log_ != NULL) {
     delete log_;
     log_ = NULL;
   }
   FILE* fp;
-  if ((fp = fopen(filename, "a")) == NULL) {
-    err = string("could not open file:") + filename + ", "
+  if ((fp = fopen(filename->c_str(), "a")) == NULL) {
+    err = string("could not open file:") + *filename + ", "
       + hq_util::strerror(errno);
     return 1;
   }
@@ -1016,11 +1019,25 @@ string hq_util::strerror(int err)
   return buf;
 }
 
+bool hq_util::lceq(const char* x, const char* y)
+{
+#define LC(c) ('A' <= c && c <= 'Z' ? c + 0x20 : c)
+  for (; *x != '\0'; x++, y++)
+    if (LC(*x) != LC(*y))
+      return false;
+  return *y == '\0';
+}
+
+bool hq_util::lceq(const string& x, const string& y)
+{
+  return x.size() == y.size() && lceq(x.c_str(), y.c_str());
+}
+
 struct hq_help : public picoopt::config_base<hq_help> {
   hq_help()
     : picoopt::config_base<hq_help>("help", no_argument, "  print this help")
   {}
-  virtual int setup(const char*, string&) {
+  virtual int setup(const string*, string&) {
     picoopt::print_help(stdout, "HQ - a queue-based HTTP server");
     exit(0);
   }
@@ -1031,18 +1048,19 @@ struct hq_log_level : public picoopt::config_base<hq_log_level> {
     : picoopt::config_base<hq_log_level>("log-level", required_argument,
 					 "=debug|info|warn|error|crit|none")
   {}
-  virtual int setup(const char* level, string& err) {
+  virtual int setup(const string* level, string& err) {
     for (int i = 0; i < picolog::NUM_LEVELS; i++) {
-      if (strcasecmp(picolog::level_labels[i], level) == 0) {
+      if (hq_util::lceq(picolog::level_labels[i], *level)) {
 	picolog::set_log_level(i);
 	return 0;
       }
     }
-    if (strcasecmp(level, "none") == 0) {
+    const static string none("none");
+    if (hq_util::lceq(*level, none)) {
       picolog::set_log_level(picolog::NUM_LEVELS);
       return 0;
     }
-    err = string("unknown log level:") + level;
+    err = string("unknown log level:") + *level;
     return 1;
   }
 };

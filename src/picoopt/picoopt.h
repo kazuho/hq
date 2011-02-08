@@ -41,7 +41,7 @@ public:
     size_t index_;
   public:
     virtual ~config_core();
-    virtual int setup(const char* arg, std::string& err) = 0;
+    virtual int setup(const std::string* arg, std::string& err) = 0;
     virtual int post_setup(std::string& err);
     const char* name() const { return name_; }
     const std::string& desc() const { return desc_; }

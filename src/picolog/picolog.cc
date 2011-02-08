@@ -21,7 +21,7 @@ void picolog::_flush()
   delete ss_;
 }
 
-const char* picolog::level_labels[] = {
+const string picolog::level_labels[] = {
   "DEBUG",
   "INFO",
   "WARN",

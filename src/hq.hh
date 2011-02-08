@@ -251,7 +251,6 @@ public:
   virtual ~hq_handler() {}
   /**
    * dispatches a request
-   * @return whether or not the request was dispatched
    */
   virtual bool dispatch(const hq_req_reader& req, hq_res_sender* res_sender) = 0;
 public:
@@ -390,7 +389,7 @@ public:
     size_t called_cnt_;
   public:
     config();
-    virtual int setup(const char* hostport, std::string& err);
+    virtual int setup(const std::string* hostport, std::string& err);
     virtual int post_setup(std::string& err);
   };
   class poll_guard {
@@ -443,7 +442,7 @@ public:
   class config : public picoopt::config_base<config> {
   public:
     config();
-    virtual int setup(const char* mapping, std::string& err);
+    virtual int setup(const std::string* mapping, std::string& err);
   };
 protected:
   std::string vpath_; // with trailing slash
@@ -471,7 +470,7 @@ public:
     config()
       : picoopt::config_base<config>("log-file", required_argument, "=file")
     {}
-    virtual int setup(const char* filename, std::string& err);
+    virtual int setup(const std::string* filename, std::string& err);
   };
 protected:
   FILE* fp_;
@@ -491,6 +490,8 @@ public:
   static std::string get_ext(const std::string& path);
   static std::string gethostof(int fd);
   static std::string strerror(int err);
+  static bool lceq(const char* x, const char* y);
+  static bool lceq(const std::string& x, const std::string& y);
 };
 
 #endif
