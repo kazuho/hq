@@ -26,6 +26,18 @@ public:
     NUM_LEVELS
   };
   
+  template <typename Arg, typename Result> struct mem_fun_t {
+    Result (*f_)(Arg);
+    Arg arg_;
+    mem_fun_t(Result (*f)(Arg), Arg a) : f_(f) {}
+    friend std::ostream& operator<<(std::ostream& os, const mem_fun_t<Arg, Result>& op) {
+      return os << op.f_(op.arg_);
+    }
+  };
+  template <typename Arg, typename Result> static mem_fun_t<Arg, Result> mem_fun(Result (*f)(Arg), Arg a) {
+    return mem_fun_t<Arg, Result>(f, a);
+  }
+  
 protected:
   int fd_;
   std::ostringstream* ss_;

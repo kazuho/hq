@@ -27,22 +27,6 @@ extern "C" {
 
 using namespace std;
 
-string hq_gethostof::str() const
-{
-  sockaddr_in sin;
-  socklen_t slen = sizeof(sin);
-  if (getpeername(fd_, (sockaddr*)&sin, &slen) == 0
-      && sin.sin_family == AF_INET) {
-    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
-    mutex_guard g(&m);
-    return inet_ntoa(sin.sin_addr);
-  } else {
-    char buf[32];
-    sprintf(buf, "fd=%d", fd_);
-    return buf;
-  }
-}
-
 hq_req_reader::hq_req_reader()
   : buf_(), method_(), path_(), headers_(), content_(NULL),
     state_(READ_REQUEST)
@@ -76,7 +60,7 @@ hq_req_reader::_read_request(int fd)
  RETRY:
   if ((r = read(fd, buf_.prepare(READ_MAX), READ_MAX)) == 0) {
     // closed by peer
-    picolog::info() << hq_gethostof(fd)
+    picolog::info() << picolog::mem_fun(hq_util::gethostof, fd)
 		    << " closed by peer while reading the request";
     return false;
   } else if (r == -1) { // error
@@ -85,8 +69,8 @@ hq_req_reader::_read_request(int fd)
     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return true;
     } else {
-      picolog::error() << hq_gethostof(fd) << " closing due to I/O error "
-		       << errno;
+      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
+		       << " closing due to I/O error:" << errno;
       return false;
     }
   }
@@ -101,7 +85,7 @@ hq_req_reader::_read_request(int fd)
     r = phr_parse_request(buf_.buffer(), buf_.size(), &method, &method_len,
 			  &path, &path_len, &minor_version, hdrs, &num_hdrs, 0);
     if (r == -1) { // error
-      picolog::info() << hq_gethostof(fd)
+      picolog::info() << picolog::mem_fun(hq_util::gethostof, fd)
 		      << " received a broken HTTP request";
       return false;
     } else if (r == -2) { // partial
@@ -135,7 +119,7 @@ hq_req_reader::_read_request(int fd)
   }
   // have content-length
   if (sscanf("%llu", clen_iter->second.c_str(), &content_length_) != 1) {
-    picolog::error() << hq_gethostof(fd)
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		     << " got an invalid content-length header, closing";
     return false;
   }
@@ -160,7 +144,7 @@ bool hq_req_reader::_read_content(int fd)
  RETRY:
   if ((r = read(fd, content_->prepare(maxlen), maxlen)) == 0) {
     // closed by peer
-    picolog::error() << hq_gethostof(fd)
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		     << " closed by peer while reading the request content";
     return false;
   } else if (r == -1) { // error
@@ -169,8 +153,8 @@ bool hq_req_reader::_read_content(int fd)
     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return true;
     } else {
-      picolog::error() << hq_gethostof(fd) << " closing due to I/O error "
-		       << errno;
+      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
+		       << " closing due to I/O error:" << errno;
       return false;
     }
   }
@@ -384,7 +368,9 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
   } else if (errno == EINTR) {
     goto RETRY;
   } else if (! (errno == EAGAIN || errno == EWOULDBLOCK)) {
-    picolog::error() << hq_gethostof(fd) << " sendfile(2) failed while sending response, errno:" << errno;
+    picolog::error() << picolog::mem_fun(gethostof, fd)
+		     << " sendfile(2) failed while sending response, errno:"
+		     << errno;
     goto ON_CLOSE;
   }
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
@@ -417,7 +403,9 @@ bool hq_client::_write_sendbuf(bool disactivate_poll_when_empty)
   } else if (errno == EINTR) {
     goto RETRY;
   } else if (! (errno == EINTR || errno == EWOULDBLOCK)) {
-    picolog::error() << hq_gethostof(fd_) << " write(2) failed while sending response, errno:" << errno;
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+		     << " write(2) failed while sending response, errno:"
+		     << errno;
     goto ON_CLOSE;
   }
   picoev_set_events(hq_loop::get_loop(), fd_,
@@ -574,7 +562,8 @@ void hq_worker::_read_response_header(int fd, int revents)
  RETRY:
   if ((r = read(fd_, buf_.prepare(READ_MAX), READ_MAX)) == 0) {
     // closed
-    picolog::error() << hq_gethostof(fd) << " worker closed the connection";
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
+		     << " worker closed the connection";
     _return_error(500, "connection closed by worker");
     goto CLOSE;
   } else if (r == -1) {
@@ -583,7 +572,7 @@ void hq_worker::_read_response_header(int fd, int revents)
     } else if (r == EAGAIN || r == EWOULDBLOCK) {
       return;
     } else {
-      picolog::error() << hq_gethostof(fd)
+      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		       << " failed to read response from worker, errno:"
 		       << errno;
       _return_error(500, "worker connection error");
@@ -600,7 +589,7 @@ void hq_worker::_read_response_header(int fd, int revents)
     r = phr_parse_response(buf_.buffer(), buf_.size(), &minor_version, &status,
 			   &msg_p, &msg_len, headers, &num_headers, 0);
     if (r == -1) { // error
-      picolog::error() << hq_gethostof(fd)
+      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		       << " received a broken HTTP request";
       _return_error(500, "worker response error");
       goto CLOSE;
@@ -651,7 +640,7 @@ void hq_worker::_read_response_body(int fd, int revents)
     } else if (r == EAGAIN || r == EWOULDBLOCK) {
       return;
     } else {
-      picolog::error() << hq_gethostof(fd)
+      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		       << " failed to read response content from worker, errno:"
 		       << errno;
       goto CLOSE;
@@ -925,6 +914,20 @@ string hq_util::get_ext(const string& path)
     } while (i != path.begin());
   }
   return string();
+}
+
+string hq_util::gethostof(int fd)
+{
+  if (getpeername(fd, (sockaddr*)&sin, &slen) == 0
+      && sin.sin_family == AF_INET) {
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    mutex_guard g(&m);
+    return inet_ntoa(sin.sin_addr);
+  } else {
+    char buf[32];
+    sprintf(buf, "fd=%d", fd);
+    return buf;
+  }
 }
 
 struct hq_help : public picoopt::config_base<hq_help> {

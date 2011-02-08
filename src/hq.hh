@@ -160,15 +160,6 @@ private:
   hq_buffer& operator=(const hq_buffer&); // not used
 };
 
-class hq_gethostof {
-protected:
-  int fd_;
-public:
-  hq_gethostof(int fd) : fd_(fd) {}
-  std::string str() const;
-  friend std::ostream& operator<<(std::ostream& os, const hq_gethostof& self) { return os << self.str(); }
-};
-
 /**
  * reads a HTTP request
  */
@@ -473,6 +464,7 @@ public:
   static hq_headers::const_iterator find_header(const hq_headers& hdrs, const std::string& name);
   static std::string get_mime_type(const std::string& ext);
   static std::string get_ext(const std::string& path);
+  static std::string gethostof(int fd);
 };
 
 #endif
