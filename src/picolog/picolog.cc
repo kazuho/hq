@@ -1,8 +1,11 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include "picolog/picolog.h"
 
 using namespace std;
+
+template <typename T> void ignore_result(T) {}
 
 void picolog::_init(int level)
 {
@@ -14,7 +17,7 @@ void picolog::_flush()
 {
   *ss_ << endl;
   string s = ss_->str();
-  write(fd_, s.c_str(), s.size());
+  ignore_result(write(fd_, s.c_str(), (ssize_t)s.size()));
   delete ss_;
 }
 

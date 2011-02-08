@@ -3,11 +3,11 @@ hq_SOURCES=	hq.cc picohttpparser/picohttpparser.c picolog/picolog.cc picoopt/pic
 if PICOEV_USE_KQUEUE
 hq_SOURCES+=	picoev/picoev_kqueue.c
 else
- if PICOEV_USE_EPOLL
+if PICOEV_USE_EPOLL
 hq_SOURCES+=	picoev/picoev_epoll.c
- else
+else
 hq_SOURCES+=	picoev/picoev_select.c
- endif
+endif
 endif
 hq_CFLAGS=	$(AM_CFLAGS) -Wall
 hq_CXXFLAGS=	$(AM_CFLAGS) -Wall

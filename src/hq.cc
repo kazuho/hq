@@ -9,6 +9,9 @@ extern "C" {
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifdef __linux__
+#include <sys/sendfile.h>
+#endif
 }
 #include <algorithm>
 
