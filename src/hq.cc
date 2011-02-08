@@ -28,7 +28,7 @@ extern "C" {
 using namespace std;
 
 hq_req_reader::hq_req_reader()
-  : buf_(), method_(), path_(), headers_(), content_(NULL),
+  : buf_(), method_(), path_(), minor_version_(0), headers_(), content_(NULL),
     state_(READ_REQUEST)
 {
 }
@@ -70,7 +70,7 @@ hq_req_reader::_read_request(int fd)
       return true;
     } else {
       picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
-		       << " closing due to I/O error:" << errno;
+		       << hq_util::strerror(errno) << ", closing the socket";
       return false;
     }
   }
@@ -94,6 +94,7 @@ hq_req_reader::_read_request(int fd)
     // got request
     method_ = string(method, method + method_len);
     path_ = string(path, path + path_len);
+    minor_version_ = minor_version;
     for (size_t i = 0; i < num_hdrs; i++) {
       if (hdrs[i].name == NULL) {
 	// continuing line
@@ -154,7 +155,7 @@ bool hq_req_reader::_read_content(int fd)
       return true;
     } else {
       picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
-		       << " closing due to I/O error:" << errno;
+		       << hq_util::strerror(errno) << ", closing the socket";
       return false;
     }
   }
@@ -186,7 +187,7 @@ void hq_handler::send_error(const hq_req_reader& req, hq_res_sender* res_sender,
   hq_headers hdrs;
   hdrs.push_back(hq_headers::value_type("Content-Type",
 					"text/plain; charset=us-ascii"));
-  if (! res_sender->open_response(500, msg, hdrs, msg.c_str(), msg.size())) {
+  if (! res_sender->open_response(status, msg, hdrs, msg.c_str(), msg.size())) {
     return;
   }
   res_sender->close_response();
@@ -208,6 +209,8 @@ hq_client::~hq_client()
 
 void hq_client::_start()
 {
+  res_.status = 0;
+  
   picoev_add(hq_loop::get_loop(), fd_, PICOEV_READ, 0,
 	     hq_picoev_cb<hq_client, &hq_client::_read_request>, this);
 }
@@ -231,7 +234,7 @@ void hq_client::_read_request(int fd, int revents)
   if (req_.method() == "START_WORKER") {
     int newfd = dup(fd_);
     if (newfd == -1) {
-      picolog::error() << "dup(2) failed due to error " << errno;
+      picolog::error() << "dup(2) failed, " << hq_util::strerror(errno);
       hq_handler::send_error(req_, this, 500, "dup failure");
       return;
     }
@@ -281,6 +284,7 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
   picoev_add(hq_loop::get_loop(), fd_, 0, 0,
 	     hq_picoev_cb<hq_client, &hq_client::_write_sendbuf_cb>, this);
   
+  res_.status = status;
   res_.sendbuf.clear();
   if (sendfile_fd != -1) {
     res_.closed_by_sender = true;
@@ -325,6 +329,10 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
 
 void hq_client::_finalize_response()
 {
+  if (hq_log_access::log_ != NULL) {
+    hq_log_access::log_->log(fd_, req_.method(), req_.path(),
+			     req_.minor_version(), res_.status);
+  }
   // TODO support for persistent connection
   delete this;
 }
@@ -368,9 +376,9 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
   } else if (errno == EINTR) {
     goto RETRY;
   } else if (! (errno == EAGAIN || errno == EWOULDBLOCK)) {
-    picolog::error() << picolog::mem_fun(gethostof, fd)
-		     << " sendfile(2) failed while sending response, errno:"
-		     << errno;
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
+		     << " sendfile(2) failed while sending response, "
+		     << hq_util::strerror(errno);
     goto ON_CLOSE;
   }
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
@@ -404,8 +412,8 @@ bool hq_client::_write_sendbuf(bool disactivate_poll_when_empty)
     goto RETRY;
   } else if (! (errno == EINTR || errno == EWOULDBLOCK)) {
     picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
-		     << " write(2) failed while sending response, errno:"
-		     << errno;
+		     << " write(2) failed while sending response, "
+		     << hq_util::strerror(errno);
     goto ON_CLOSE;
   }
   picoev_set_events(hq_loop::get_loop(), fd_,
@@ -573,8 +581,8 @@ void hq_worker::_read_response_header(int fd, int revents)
       return;
     } else {
       picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
-		       << " failed to read response from worker, errno:"
-		       << errno;
+		       << " failed to read response from worker, "
+		       << hq_util::strerror(errno);
       _return_error(500, "worker connection error");
       goto CLOSE;
     }
@@ -641,8 +649,8 @@ void hq_worker::_read_response_body(int fd, int revents)
       return;
     } else {
       picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
-		       << " failed to read response content from worker, errno:"
-		       << errno;
+		       << " failed to read response content from worker, "
+		       << hq_util::strerror(errno);
       goto CLOSE;
     }
   }
@@ -845,13 +853,13 @@ bool hq_static_handler::dispatch(const hq_req_reader& req, hq_res_sender* res_se
   int fd;
   if ((fd = open(realpath.c_str(), O_RDONLY)) == -1) {
     switch (errno) {
-    case EEXIST:
+    case ENOENT:
       picolog::error() << "file not found: " << realpath;
       send_error(req, res_sender, 404, "not found");
       break;
     default:
-      picolog::error() << "access denied to: " << realpath << ", errno:"
-		       << errno;
+      picolog::error() << "access denied to file: " << realpath << ", "
+		       << hq_util::strerror(errno);
       send_error(req, res_sender, 403, "access denied");
       break;
     }
@@ -865,6 +873,38 @@ bool hq_static_handler::dispatch(const hq_req_reader& req, hq_res_sender* res_se
   
   return true;
 }
+
+int hq_log_access::config::setup(const char* filename, string& err)
+{
+  if (log_ != NULL) {
+    delete log_;
+    log_ = NULL;
+  }
+  FILE* fp;
+  if ((fp = fopen(filename, "a")) == NULL) {
+    err = string("could not open file:") + filename + ", "
+      + hq_util::strerror(errno);
+    return 1;
+  }
+  log_ = new hq_log_access(fp);
+  return 0;
+}
+
+hq_log_access::~hq_log_access()
+{
+  fclose(fp_);
+}
+
+void hq_log_access::log(int fd, const string& method, const string& path,
+			int minor_version, int status)
+{
+  fprintf(fp_, "%s - - [%s] \"%s %s HTTP/1.%d\" %d -\n",
+	  hq_util::gethostof(fd).c_str(), picolog::now().c_str(),
+	  method.c_str(), path.c_str(), minor_version, status);
+  fflush(fp_);
+}
+
+hq_log_access* hq_log_access::log_ = NULL;
 
 hq_headers::const_iterator hq_util::find_header(const hq_headers& hdrs, const string& name)
 {
@@ -918,6 +958,8 @@ string hq_util::get_ext(const string& path)
 
 string hq_util::gethostof(int fd)
 {
+  sockaddr_in sin;
+  socklen_t slen = sizeof(sin);
   if (getpeername(fd, (sockaddr*)&sin, &slen) == 0
       && sin.sin_family == AF_INET) {
     static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
@@ -930,13 +972,41 @@ string hq_util::gethostof(int fd)
   }
 }
 
+string hq_util::strerror(int err)
+{
+  char buf[128];
+  strerror_r(err, buf, sizeof(buf));
+  return buf;
+}
+
 struct hq_help : public picoopt::config_base<hq_help> {
   hq_help()
     : picoopt::config_base<hq_help>("help", no_argument, "  print this help")
   {}
-  virtual int setup(const char*, std::string&) {
+  virtual int setup(const char*, string&) {
     picoopt::print_help(stdout, "HQ - a queue-based HTTP server");
     exit(0);
+  }
+};
+
+struct hq_log_level : public picoopt::config_base<hq_log_level> {
+  hq_log_level()
+    : picoopt::config_base<hq_log_level>("log-level", required_argument,
+					 "=debug|info|warn|error|crit|none")
+  {}
+  virtual int setup(const char* level, string& err) {
+    for (int i = 0; i < picolog::NUM_LEVELS; i++) {
+      if (strcasecmp(picolog::level_labels[i], level) == 0) {
+	picolog::set_log_level(i);
+	return 0;
+      }
+    }
+    if (strcasecmp(level, "none") == 0) {
+      picolog::set_log_level(picolog::NUM_LEVELS);
+      return 0;
+    }
+    err = string("unknown log level:") + level;
+    return 1;
   }
 };
 

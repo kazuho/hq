@@ -5,6 +5,7 @@
 extern "C" {
 #include <assert.h>
 }
+#include <cstdio>
 #include <list>
 #include <string>
 #include <vector>
@@ -168,6 +169,7 @@ protected:
   hq_buffer buf_;
   std::string method_;
   std::string path_;
+  int minor_version_;
   hq_headers headers_;
   hq_buffer* content_;
   size_t content_length_;
@@ -196,6 +198,7 @@ public:
   bool is_complete() const { return state_ == READ_COMPLETE; }
   const std::string& method() const { return method_; }
   const std::string& path() const { return path_; }
+  int minor_version() const { return minor_version_; }
   const hq_headers& headers() const { return headers_; }
   const hq_buffer* content() const { return content_; }
   size_t content_length() const { return content_length_; }
@@ -272,6 +275,7 @@ protected:
   int fd_;
   hq_req_reader req_;
   struct {
+    int status;
     hq_buffer sendbuf;
     bool closed_by_sender;
     struct {
@@ -459,12 +463,32 @@ private:
   hq_static_handler& operator=(const hq_static_handler&); // not defined
 };
 
+class hq_log_access {
+public:
+  struct config : public picoopt::config_base<config> {
+    config()
+      : picoopt::config_base<config>("log-file", required_argument, "=file")
+    {}
+    virtual int setup(const char* filename, std::string& err);
+  };
+protected:
+  FILE* fp_;
+public:
+  ~hq_log_access();
+  void log(int fd, const std::string& method, const std::string& path, int minor_version, int status);
+protected:
+  hq_log_access(FILE* fp) : fp_(fp) {}
+public:
+  static hq_log_access* log_;
+};
+
 class hq_util {
 public:
   static hq_headers::const_iterator find_header(const hq_headers& hdrs, const std::string& name);
   static std::string get_mime_type(const std::string& ext);
   static std::string get_ext(const std::string& path);
   static std::string gethostof(int fd);
+  static std::string strerror(int err);
 };
 
 #endif

@@ -14,6 +14,7 @@
 #ifndef PICOLOG_H
 #define PICOLOG_H
 
+#include <string>
 #include <sstream>
 
 class picolog {
@@ -29,7 +30,7 @@ public:
   template <typename Arg, typename Result> struct mem_fun_t {
     Result (*f_)(Arg);
     Arg arg_;
-    mem_fun_t(Result (*f)(Arg), Arg a) : f_(f) {}
+    mem_fun_t(Result (*f)(Arg), Arg arg) : f_(f), arg_(arg) {}
     friend std::ostream& operator<<(std::ostream& os, const mem_fun_t<Arg, Result>& op) {
       return os << op.f_(op.arg_);
     }
@@ -39,11 +40,10 @@ public:
   }
   
 protected:
-  int fd_;
   std::ostringstream* ss_;
 public:
-  explicit picolog(int level) : fd_(fds_[level]), ss_(NULL) {
-    if (fd_ != -1)
+  explicit picolog(int level) : ss_(NULL) {
+    if (log_level_ <= level)
       _init(level);
   }
   ~picolog() {
@@ -60,26 +60,36 @@ private:
   /**
    * copy constructor delegates the ownership, only used by myself
    */
-  picolog(const picolog& x) : fd_(x.fd_), ss_(x.ss_) {
+  picolog(const picolog& x) : ss_(x.ss_) {
     // do not use std::swap so that NULLification can be an optimization hint
     const_cast<picolog&>(x).ss_ = NULL;
   }
   picolog& operator=(const picolog&); // not defined
   void _init(int level);
   void _flush();
+public:
+  static const char* level_labels[];
 protected:
-  static int fds_[NUM_LEVELS]; // closed if fds_[x] == -1
+  static int fd_;
+  static int log_level_;
 public:
   static picolog debug() { return picolog(DEBUG); }
   static picolog info() { return picolog(INFO); }
   static picolog warn() { return picolog(WARN); }
   static picolog error() { return picolog(ERROR); }
-  static void set_fd(int level, int fd) {
-    fds_[level] = fd;
+  static void set_fd(int fd) {
+    fd_ = fd;
   }
-  static int get_fd(int level) {
-    return fds_[level];
+  static int get_fd() {
+    return fd_;
   }
+  static void set_log_level(int level) {
+    log_level_ = level;
+  }
+  static int get_log_level() {
+    return log_level_;
+  }
+  static std::string now();
 };
 
 #endif
