@@ -31,14 +31,27 @@ extern "C" {
 using namespace std;
 
 hq_req_reader::hq_req_reader()
-  : buf_(), method_(), path_(), minor_version_(0), headers_(), content_(NULL),
-    state_(READ_REQUEST)
+  : buf_(), method_(), path_(), headers_(), content_(NULL)
 {
+  reset();
 }
 
 hq_req_reader::~hq_req_reader()
 {
   delete content_;
+}
+
+void hq_req_reader::reset()
+{
+  buf_.clear();
+  method_.clear();
+  path_.clear();
+  minor_version_ = 0;
+  headers_.clear();
+  delete content_;
+  content_ = NULL;
+  content_length_ = 0;
+  state_ = READ_REQUEST;
 }
 
 bool
@@ -200,7 +213,7 @@ hq_client::hq_client(int fd)
   : fd_(fd), req_()
 {
   picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
-  _start();
+  _reset();
 }
 
 hq_client::~hq_client()
@@ -211,9 +224,12 @@ hq_client::~hq_client()
   close(fd_);
 }
 
-void hq_client::_start()
+void hq_client::_reset()
 {
+  req_.reset();
   res_.status = 0;
+  res_.sendbuf.clear();
+  keep_alive_ = false;
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_READ);
   picoev_set_callback(hq_loop::get_loop(), fd_,
 		      hq_picoev_cb<hq_client, &hq_client::_read_request>, NULL);
@@ -276,7 +292,7 @@ void hq_client::close_response()
 {
   res_.closed_by_sender = true;
   if (res_.sendbuf.empty()) {
-    _finalize_response();
+    _finalize_response(true);
   }
 }
 
@@ -307,7 +323,6 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
 			NULL);
   }
   
-  // TODO support for keep-alive and HTTP/1.1
   {
     char buf[sizeof("HTTP/1.1 -1234567890 ")];
     sprintf(buf, "HTTP/1.1 %d ", status);
@@ -315,32 +330,67 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
   }
   res_.sendbuf.push(msg);
   res_.sendbuf.push("\r\n", 2);
+  bool have_content_length = false;
   if (res_.sendfile.fd != -1) {
     char buf[sizeof("Content-Length: \r\n") + 24];
     sprintf(buf, "Content-Length: %llu\r\n",
 	    (unsigned long long)res_.sendfile.size);
     res_.sendbuf.push(buf, strlen(buf));
+    have_content_length = true;
   }
   for (hq_headers::const_iterator i = headers.begin();
        i != headers.end();
        ++i) {
-    // TODO should we sanitize headers like Connection, Content-Length here?
-    res_.sendbuf.push(i->first);
-    res_.sendbuf.push(": ", 2);
-    res_.sendbuf.push(i->second);
-    res_.sendbuf.push("\r\n", 2);
+    const static string connection("connection"),
+      content_length("content-length");
+    if (hq_util::lceq(i->first, connection)) {
+      // skip
+    } else {
+      fprintf(stderr, "comparing '%s', '%s'\n", i->first.c_str(),
+	      content_length.c_str());
+      if (! have_content_length && hq_util::lceq(i->first, content_length)) {
+	have_content_length = true;
+      }
+      res_.sendbuf.push(i->first);
+      res_.sendbuf.push(": ", 2);
+      res_.sendbuf.push(i->second);
+      res_.sendbuf.push("\r\n", 2);
+    }
   }
+  // TODO add support for content-encoding: chunked
+  bool can_keep_alive = have_content_length;
+  if (have_content_length) {
+    for (hq_headers::const_iterator i = req_.headers().begin();
+	 i != req_.headers().end();
+	 ++i) {
+      const static string connection("connection");
+      if (hq_util::lceq(i->first, connection)) {
+	const static string keep_alive("keep-alive");
+	if (! hq_util::lceq(i->second, keep_alive)) {
+	  can_keep_alive = false;
+	}
+	break;
+      }
+    }
+  }
+  keep_alive_ = can_keep_alive;
+  res_.sendbuf.push(keep_alive_
+		    ? "Connection: keep-alive\r\n"
+		    : "Connection: close\r\n");
   res_.sendbuf.push("\r\n", 2);
 }
 
-void hq_client::_finalize_response()
+void hq_client::_finalize_response(bool success)
 {
   if (hq_log_access::log_ != NULL) {
     hq_log_access::log_->log(fd_, req_.method(), req_.path(),
 			     req_.minor_version(), res_.status);
   }
-  // TODO support for persistent connection
-  delete this;
+  if (success && keep_alive_) {
+    _reset();
+  } else {
+    delete this;
+  }
 }
 
 void hq_client::_write_sendfile_cb(int fd, int revents)
@@ -351,7 +401,7 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
   // flush header
   if (! res_.sendbuf.empty()) {
     if (! _write_sendbuf(false)) {
-      goto ON_CLOSE;
+      return;
     }
     if (! res_.sendbuf.empty()) {
       return;
@@ -376,7 +426,7 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
 #endif
   if (r == 0) {
     if (res_.sendfile.pos == res_.sendfile.size) {
-      _finalize_response();
+      _finalize_response(true);
       return;
     }
   } else if (errno == EINTR) {
@@ -385,13 +435,10 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
     picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		     << " sendfile(2) failed while sending response, "
 		     << hq_util::strerror(errno);
-    goto ON_CLOSE;
+    _finalize_response(false);
+    return;
   }
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
-  return;
-  
- ON_CLOSE:
-  delete this;
 }
 
 void hq_client::_write_sendbuf_cb(int fd, int revents)
@@ -403,7 +450,7 @@ void hq_client::_write_sendbuf_cb(int fd, int revents)
     return;
   }
   if (res_.sendbuf.empty() && res_.closed_by_sender) {
-    _finalize_response();
+    _finalize_response(true);
   }
 }
 
@@ -420,15 +467,12 @@ bool hq_client::_write_sendbuf(bool disactivate_poll_when_empty)
     picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
 		     << " write(2) failed while sending response, "
 		     << hq_util::strerror(errno);
-    goto ON_CLOSE;
+    _finalize_response(false);
+    return false;
   }
   picoev_set_events(hq_loop::get_loop(), fd_,
 		    res_.sendbuf.empty() ? 0 : PICOEV_WRITE);
   return true;
-  
- ON_CLOSE:
-  delete this;
-  return false;
 }
 
 hq_worker::handler::handler()

@@ -188,6 +188,10 @@ public:
    */
   ~hq_req_reader();
   /**
+   * clears the reader
+   */
+  void reset();
+  /**
    * reads a HTTP request
    * @return false on error otherwise true (caller should check if the request has been completely received by calling is_complete())
    */
@@ -282,6 +286,7 @@ protected:
       off_t pos, size;
     } sendfile;
   } res_;
+  bool keep_alive_;
 public:
   /**
    * constructor
@@ -292,14 +297,14 @@ public:
    */
   virtual ~hq_client();
 protected:
-  void _start();
+  void _reset();
   void _read_request(int fd, int revents);
   virtual void send_file_response(int status, const std::string& msg, const hq_headers& headers, int fd);
   virtual bool open_response(int status, const std::string& msg, const hq_headers& headers, const char* data, size_t len);
   virtual bool send_response(const char* data, size_t len);
   virtual void close_response();
   void _prepare_response(int status, const std::string& msg, const hq_headers& hedaers, const int sendfile_fd);
-  void _finalize_response();
+  void _finalize_response(bool success);
   void _write_sendfile_cb(int fd, int revents);
   void _write_sendbuf_cb(int fd, int revents);
   bool _write_sendbuf(bool disactivate_poll_when_empty);
