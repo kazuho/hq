@@ -368,6 +368,7 @@ public:
    */
   ~hq_worker();
 protected:
+  void _send_upgrade(int fd, int revents);
   void _prepare_next();
   void _start(const hq_req_reader* req, hq_res_sender* res_sender);
   void _send_request_cb(int fd, int revents);
@@ -375,6 +376,7 @@ protected:
   void _read_response_header(int fd, int revents);
   void _read_response_body(int fd, int revents);
   void _return_error(int status, const std::string& msg);
+  bool _send_buffer();
 protected:
   static handler handler_;
 public:

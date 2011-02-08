@@ -475,7 +475,9 @@ void hq_worker::handler::_start_worker_or_register(hq_worker* worker)
 hq_worker::hq_worker(int fd, const hq_req_reader&)
   : fd_(fd), req_(NULL), res_sender_(NULL), buf_()
 {
-  _prepare_next();
+  buf_.push("HTTP/1.1 101 Upgrade\r\n"
+	    "Upgrade: HTTPWORKER/0.9\r\n\r\n");
+  _send_upgrade(fd, PICOEV_WRITE);
 }
 
 hq_worker::~hq_worker()
@@ -488,8 +490,32 @@ hq_worker::~hq_worker()
   close(fd_);
 }
 
+void hq_worker::_send_upgrade(int fd, int revents)
+{
+  assert(fd == fd_);
+  assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
+  
+  if (! _send_buffer()) {
+    picolog::info() << picolog::mem_fun(hq_util::gethostof, fd)
+		    << " worker closed the connection unexpectedly, "
+		    << hq_util::strerror(errno);
+    delete this;
+  }
+  if (! buf_.empty()) {
+    if (! picoev_is_active(hq_loop::get_loop(), fd_)) {
+      picoev_add(hq_loop::get_loop(), fd_, PICOEV_WRITE, 0,
+		 hq_picoev_cb<hq_worker, &hq_worker::_send_upgrade>, this);
+    }
+  } else {
+    _prepare_next();
+  }
+}
+
 void hq_worker::_prepare_next()
 {
+  if (picoev_is_active(hq_loop::get_loop(), fd_)) {
+    picoev_del(hq_loop::get_loop(), fd_);
+  }
   // fetch the request immediately or register myself to dispatcher
   handler_._start_worker_or_register(this);
 }
@@ -516,7 +542,7 @@ void hq_worker::_start(const hq_req_reader* req, hq_res_sender* res_sender)
   }
   buf_.push("\r\n", 2);
   
-  picoev_add(hq_loop::get_loop(), fd_, PICOEV_READ, 0,
+  picoev_add(hq_loop::get_loop(), fd_, PICOEV_WRITE, 0,
 	     hq_picoev_cb<hq_worker, &hq_worker::_send_request_cb>, this);
   _send_request();
 }
@@ -531,21 +557,10 @@ void hq_worker::_send_request_cb(int fd, int revents)
 
 void hq_worker::_send_request()
 {
-  int r;
-  
- RETRY:
-  if ((r = write(fd_, buf_.buffer(), buf_.size())) == -1) {
-    if (r == EINTR) {
-      goto RETRY;
-    } else if (r == EAGAIN || r == EWOULDBLOCK) {
-      return;
-    } else {
-      _return_error(500, "worker connection reset");
-      goto CLOSE;
-    }
+  if (! _send_buffer()) {
+    _return_error(500, "worker connection reset");
+    goto CLOSE;
   }
-  // sent some data
-  buf_.advance(r);
   if (! buf_.empty()) {
     return;
   }
@@ -682,6 +697,25 @@ void hq_worker::_return_error(int status, const string& msg)
   hq_handler::send_error(*req_, res_sender_, status, msg);
   req_ = NULL;
   res_sender_ = NULL;
+}
+
+bool hq_worker::_send_buffer()
+{
+  int r;
+  
+ RETRY:
+  if ((r = write(fd_, buf_.buffer(), buf_.size())) == -1) {
+    if (r == EINTR) {
+      goto RETRY;
+    } else if (r == EAGAIN || r == EWOULDBLOCK) {
+      return true;
+    } else {
+      return false;
+    }
+  }
+  buf_.advance(r);
+  
+  return true;
 }
 
 hq_worker::handler hq_worker::handler_;
