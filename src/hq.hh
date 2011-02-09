@@ -276,7 +276,7 @@ public:
 class hq_client : public hq_res_sender {
 public:
   enum response_mode {
-    RESPONSE_MODE_SIMPLE,
+    RESPONSE_MODE_HTTP10, /* not chunked */
     RESPONSE_MODE_CHUNKED,
     RESPONSE_MODE_SENDFILE
   };
@@ -289,6 +289,10 @@ protected:
     bool closed_by_sender;
     response_mode mode;
     union {
+      struct {
+	int64_t off;
+	int64_t content_length; // -1 if none
+      } http10;
       struct {
 	int fd;
 	off_t pos, size;
@@ -317,6 +321,7 @@ protected:
   void _write_sendfile_cb(int fd, int revents);
   void _write_sendbuf_cb(int fd, int revents);
   bool _write_sendbuf(bool disactivate_poll_when_empty);
+  void _push_http10_data(const char* data, size_t len);
   void _push_chunked_data(const char* data, size_t len);
 };
 

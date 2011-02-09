@@ -287,8 +287,8 @@ bool hq_client::open_response(int status, const string& msg, const hq_headers& h
   res_.closed_by_sender = false;
   if (len != 0) {
     switch (res_.mode) {
-    case RESPONSE_MODE_SIMPLE:
-      res_.sendbuf.push(data, len);
+    case RESPONSE_MODE_HTTP10:
+      _push_http10_data(data, len);
       break;
     case RESPONSE_MODE_CHUNKED:
       _push_chunked_data(data, len);
@@ -306,8 +306,8 @@ bool hq_client::send_response(const char* data, size_t len)
     return true;
   }
   switch (res_.mode) {
-  case RESPONSE_MODE_SIMPLE:
-    res_.sendbuf.push(data, len);
+  case RESPONSE_MODE_HTTP10:
+    _push_http10_data(data, len);
     break;
   case RESPONSE_MODE_CHUNKED:
     _push_chunked_data(data, len);
@@ -321,7 +321,10 @@ bool hq_client::send_response(const char* data, size_t len)
 void hq_client::close_response()
 {
   switch (res_.mode) {
-  case RESPONSE_MODE_SIMPLE:
+  case RESPONSE_MODE_HTTP10:
+    if (res_.u.http10.off != res_.u.http10.content_length) {
+      keep_alive_ = false;
+    }
     break;
   case RESPONSE_MODE_CHUNKED:
     res_.sendbuf.push("0\r\n\r\n", 5);
@@ -360,10 +363,9 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
 			NULL);
   } else {
     res_.closed_by_sender = false;
-    res_.mode = RESPONSE_MODE_SIMPLE;
-    res_.u.sendfile.fd = -1;
-    res_.u.sendfile.pos = 0;
-    res_.u.sendfile.size = 0;
+    res_.mode = RESPONSE_MODE_HTTP10;
+    res_.u.http10.off = 0;
+    res_.u.http10.content_length = -1;
     picoev_set_callback(hq_loop::get_loop(), fd_,
 			hq_picoev_cb<hq_client, &hq_client::_write_sendbuf_cb>,
 			NULL);
@@ -394,6 +396,12 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
     } else {
       if (! have_content_length && hq_util::lceq(i->first, content_length)) {
 	have_content_length = true;
+	if (res_.mode == RESPONSE_MODE_HTTP10) {
+	  res_.u.http10.content_length
+	    = hq_util::parse_positive_number(i->second.c_str(),
+					     i->second.size());
+	  assert(res_.u.http10.content_length != -1); // should've been verified
+	}
       }
       res_.sendbuf.push(i->first);
       res_.sendbuf.push(": ", 2);
@@ -416,7 +424,7 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
       }
     }
   }
-  if (res_.mode == RESPONSE_MODE_SIMPLE && can_keep_alive
+  if (res_.mode == RESPONSE_MODE_HTTP10 && can_keep_alive
       && ! have_content_length) {
     // use chunked encoding
     res_.sendbuf.push("Transfer-Encoding: chunked\r\n");
@@ -495,7 +503,7 @@ void hq_client::_write_sendbuf_cb(int fd, int revents)
 {
   assert(fd_ == fd);
   assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
-  assert(res_.mode == RESPONSE_MODE_SIMPLE
+  assert(res_.mode == RESPONSE_MODE_HTTP10
 	 || res_.mode == RESPONSE_MODE_CHUNKED);
   
   if (! _write_sendbuf(true)) {
@@ -526,6 +534,14 @@ bool hq_client::_write_sendbuf(bool disactivate_poll_when_empty)
   picoev_set_events(hq_loop::get_loop(), fd_,
 		    res_.sendbuf.empty() ? 0 : PICOEV_WRITE);
   return true;
+}
+
+void hq_client::_push_http10_data(const char* data, size_t len)
+{
+  res_.sendbuf.push(data, len);
+  res_.u.http10.off += len;
+  assert(res_.u.http10.content_length == -1
+	 || res_.u.http10.off <= res_.u.http10.content_length);
 }
 
 void hq_client::_push_chunked_data(const char* data, size_t len)
