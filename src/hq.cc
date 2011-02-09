@@ -128,6 +128,11 @@ hq_req_reader::_read_request(int fd)
   }
   buf_.advance(r);
   // TODO chunked support
+  if (hq_util::find_header(headers_, "content-encoding") != headers_.end()) {
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
+		     << "sorry requests using chunked encoding not supported";
+    return false;
+  }
   hq_headers::const_iterator clen_iter
     = hq_util::find_header(headers_, "content-length");
   if (clen_iter == headers_.end()) {
