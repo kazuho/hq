@@ -274,6 +274,12 @@ public:
  * HTTP client
  */
 class hq_client : public hq_res_sender {
+public:
+  enum response_mode {
+    RESPONSE_MODE_SIMPLE,
+    RESPONSE_MODE_CHUNKED,
+    RESPONSE_MODE_SENDFILE
+  };
 protected:
   int fd_;
   hq_req_reader req_;
@@ -281,10 +287,13 @@ protected:
     int status;
     hq_buffer sendbuf;
     bool closed_by_sender;
-    struct {
-      int fd;
-      off_t pos, size;
-    } sendfile;
+    response_mode mode;
+    union {
+      struct {
+	int fd;
+	off_t pos, size;
+      } sendfile;
+    } u;
   } res_;
   bool keep_alive_;
 public:

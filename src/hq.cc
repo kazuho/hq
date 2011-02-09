@@ -284,12 +284,47 @@ bool hq_client::open_response(int status, const string& msg, const hq_headers& h
 
 bool hq_client::send_response(const char* data, size_t len)
 {
-  res_.sendbuf.push(data, len);
+  if (len == 0) {
+    return true;
+  }
+  switch (res_.mode) {
+  case RESPONSE_MODE_SIMPLE:
+    res_.sendbuf.push(data, len);
+    break;
+  case RESPONSE_MODE_CHUNKED:
+    while (len != 0) {
+      unsigned chunk_len = (unsigned)min(len, (size_t)1048576);
+      char buf[16];
+      sprintf(buf, "%u\r\n", chunk_len);
+      res_.sendbuf.push(buf, strlen(buf));
+      res_.sendbuf.push(data, chunk_len);
+      res_.sendbuf.push("\r\n", 2);
+      data += chunk_len;
+      len -= chunk_len;
+    }
+    break;
+  default:
+    assert(0);
+  }
   return _write_sendbuf(true);
 }
 
 void hq_client::close_response()
 {
+  switch (res_.mode) {
+  case RESPONSE_MODE_SIMPLE:
+    break;
+  case RESPONSE_MODE_CHUNKED:
+    res_.sendbuf.push("0\r\n", 3);
+    if (! _write_sendbuf(true)) {
+      _finalize_response(false);
+      return;
+    }
+    break;
+  default:
+    assert(0);
+  }
+  
   res_.closed_by_sender = true;
   if (res_.sendbuf.empty()) {
     _finalize_response(true);
@@ -304,20 +339,22 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
   res_.sendbuf.clear();
   if (sendfile_fd != -1) {
     res_.closed_by_sender = true;
-    res_.sendfile.fd = sendfile_fd;
-    res_.sendfile.pos = 0;
+    res_.mode = RESPONSE_MODE_SENDFILE;
+    res_.u.sendfile.fd = sendfile_fd;
+    res_.u.sendfile.pos = 0;
     struct stat st;
-    int r = fstat(res_.sendfile.fd, &st);
+    int r = fstat(res_.u.sendfile.fd, &st);
     assert(r == 0); // fstat error is really fatal
-    res_.sendfile.size = st.st_size;
+    res_.u.sendfile.size = st.st_size;
     picoev_set_callback(hq_loop::get_loop(), fd_,
 			hq_picoev_cb<hq_client, &hq_client::_write_sendfile_cb>,
 			NULL);
   } else {
     res_.closed_by_sender = false;
-    res_.sendfile.fd = -1;
-    res_.sendfile.pos = 0;
-    res_.sendfile.size = 0;
+    res_.mode = RESPONSE_MODE_SIMPLE;
+    res_.u.sendfile.fd = -1;
+    res_.u.sendfile.pos = 0;
+    res_.u.sendfile.size = 0;
     picoev_set_callback(hq_loop::get_loop(), fd_,
 			hq_picoev_cb<hq_client, &hq_client::_write_sendbuf_cb>,
 			NULL);
@@ -331,10 +368,10 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
   res_.sendbuf.push(msg);
   res_.sendbuf.push("\r\n", 2);
   bool have_content_length = false;
-  if (res_.sendfile.fd != -1) {
+  if (res_.mode == RESPONSE_MODE_SENDFILE) {
     char buf[sizeof("Content-Length: \r\n") + 24];
     sprintf(buf, "Content-Length: %llu\r\n",
-	    (unsigned long long)res_.sendfile.size);
+	    (unsigned long long)res_.u.sendfile.size);
     res_.sendbuf.push(buf, strlen(buf));
     have_content_length = true;
   }
@@ -346,8 +383,6 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
     if (hq_util::lceq(i->first, connection)) {
       // skip
     } else {
-      fprintf(stderr, "comparing '%s', '%s'\n", i->first.c_str(),
-	      content_length.c_str());
       if (! have_content_length && hq_util::lceq(i->first, content_length)) {
 	have_content_length = true;
       }
@@ -357,9 +392,8 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
       res_.sendbuf.push("\r\n", 2);
     }
   }
-  // TODO add support for content-encoding: chunked
-  bool can_keep_alive = have_content_length;
-  if (have_content_length) {
+  bool can_keep_alive = have_content_length || req_.minor_version() >= 1;
+  if (can_keep_alive) {
     for (hq_headers::const_iterator i = req_.headers().begin();
 	 i != req_.headers().end();
 	 ++i) {
@@ -372,6 +406,12 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
 	break;
       }
     }
+  }
+  if (res_.mode == RESPONSE_MODE_SIMPLE && can_keep_alive
+      && ! have_content_length) {
+    // use chunked encoding
+    res_.sendbuf.push("Content-Encoding: chunked\r\n");
+    res_.mode = RESPONSE_MODE_CHUNKED;
   }
   keep_alive_ = can_keep_alive;
   res_.sendbuf.push(keep_alive_
@@ -397,6 +437,7 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
 {
   assert(fd_ == fd);
   assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
+  assert(res_.mode == RESPONSE_MODE_SENDFILE);
   
   // flush header
   if (! res_.sendbuf.empty()) {
@@ -412,20 +453,20 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
  RETRY:
   int r;
 #if HQ_IS_LINUX
-  r = sendfile(fd_, res_.sendfile.fd, &res_.sendfile.pos, 1048576);
+  r = sendfile(fd_, res_.u.sendfile.fd, &res_.sendfile.pos, 1048576);
 #elif HQ_IS_BSD
   {
-    off_t len = min((off_t)1048576, res_.sendfile.size);
-    r = sendfile(res_.sendfile.fd, fd_, res_.sendfile.pos, &len, NULL, 0);
+    off_t len = min((off_t)1048576, res_.u.sendfile.size);
+    r = sendfile(res_.u.sendfile.fd, fd_, res_.u.sendfile.pos, &len, NULL, 0);
     if (r == 0 || errno == EAGAIN) {
-      res_.sendfile.pos += len;
+      res_.u.sendfile.pos += len;
     }
   }
 #else
   #error "do not know the sendfile API for this OS"
 #endif
   if (r == 0) {
-    if (res_.sendfile.pos == res_.sendfile.size) {
+    if (res_.u.sendfile.pos == res_.u.sendfile.size) {
       _finalize_response(true);
       return;
     }
@@ -445,8 +486,11 @@ void hq_client::_write_sendbuf_cb(int fd, int revents)
 {
   assert(fd_ == fd);
   assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
+  assert(res_.mode == RESPONSE_MODE_SIMPLE
+	 || res_.mode == RESPONSE_MODE_CHUNKED);
   
   if (! _write_sendbuf(true)) {
+    _finalize_response(false);
     return;
   }
   if (res_.sendbuf.empty() && res_.closed_by_sender) {
