@@ -518,7 +518,6 @@ public:
 
 class hq_util {
 public:
-  static hq_headers::const_iterator find_header(const hq_headers& hdrs, const std::string& name);
   static std::string get_mime_type(const std::string& ext);
   static std::string get_ext(const std::string& path);
   static std::string gethostof(int fd);
@@ -534,6 +533,7 @@ public:
   static bool lceq(const char* x, const lcstr& y);
   static bool lceq(const std::string& x, const lcstr& y);
   static bool lceq(const char* x, size_t xlen, const lcstr& y);
+  static hq_headers::const_iterator find_header(const hq_headers& headers, const lcstr& name);
   static int64_t parse_positive_number(const char* str, size_t len);
 };
 

@@ -128,13 +128,15 @@ hq_req_reader::_read_request(int fd)
   }
   buf_.advance(r);
   // TODO chunked support
-  if (hq_util::find_header(headers_, "transfer-encoding") != headers_.end()) {
+  static const hq_util::lcstr transfer_encoding("transfer-encoding");
+  if (hq_util::find_header(headers_, transfer_encoding) != headers_.end()) {
     picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		     << "sorry requests using chunked encoding not supported";
     return false;
   }
+  static const hq_util::lcstr content_length("content-length");
   hq_headers::const_iterator clen_iter
-    = hq_util::find_header(headers_, "content-length");
+    = hq_util::find_header(headers_, content_length);
   if (clen_iter == headers_.end()) {
     state_ = READ_COMPLETE;
     return true;
@@ -1164,26 +1166,6 @@ void hq_log_access::log(int fd, const string& method, const string& path,
 
 hq_log_access* hq_log_access::log_ = NULL;
 
-hq_headers::const_iterator hq_util::find_header(const hq_headers& hdrs, const string& name)
-{
-  hq_headers::const_iterator i;
-  for (i= hdrs.begin(); i != hdrs.end(); ++i) {
-    if (i->first.size() != name.size()) {
-      goto NEXT;
-    }
-    for (size_t j = 0; j < name.size(); ++j) {
-      if (tolower(i->first[j]) != tolower(name[j])) {
-	goto NEXT;
-      }
-    }
-    // equals
-    break;
-  NEXT:
-    ;
-  }
-  return i;
-}
-
 string hq_util::get_mime_type(const string& ext)
 {
 #define MAP(e, m) if (ext == e) return m
@@ -1283,6 +1265,20 @@ bool hq_util::lceq(const char* x, size_t xlen, const lcstr& y)
     if (lc(*x++) != *yi)
       return false;
   return true;
+}
+
+hq_headers::const_iterator hq_util::find_header(const hq_headers& headers,
+						const lcstr& name)
+{
+  // bind2nd cannot take functions that accept constrefs as args...
+  for (hq_headers::const_iterator i = headers.begin();
+       i != headers.end();
+       ++i) {
+    if (lceq(i->first, name)) {
+      return i;
+    }
+  }
+  return headers.end();
 }
 
 int64_t hq_util::parse_positive_number(const char* str, size_t len)
