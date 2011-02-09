@@ -85,7 +85,7 @@ hq_req_reader::_read_request(int fd)
     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
       return true;
     } else {
-      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
+      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd) << ' '
 		       << hq_util::strerror(errno) << ", closing the socket";
       return false;
     }
@@ -128,7 +128,7 @@ hq_req_reader::_read_request(int fd)
   }
   buf_.advance(r);
   // TODO chunked support
-  if (hq_util::find_header(headers_, "content-encoding") != headers_.end()) {
+  if (hq_util::find_header(headers_, "transfer-encoding") != headers_.end()) {
     picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		     << "sorry requests using chunked encoding not supported";
     return false;
@@ -140,13 +140,16 @@ hq_req_reader::_read_request(int fd)
     return true;
   }
   // have content-length
-  if (sscanf("%llu", clen_iter->second.c_str(), &content_length_) != 1) {
+  if ((content_length_
+       = hq_util::parse_positive_number(clen_iter->second.c_str(),
+					clen_iter->second.size()))
+      == -1) {
     picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		     << " got an invalid content-length header, closing";
     return false;
   }
   content_ = new hq_buffer();
-  if (content_length_ <= buf_.size()) {
+  if (content_length_ <= (int64_t)buf_.size()) {
     memcpy(content_->prepare(content_length_), buf_.buffer(),
 	   content_length_);
     buf_.advance(content_length_);
@@ -161,7 +164,7 @@ hq_req_reader::_read_request(int fd)
 
 bool hq_req_reader::_read_content(int fd)
 {
-  int maxlen = min(content_length_ - content_->size(), (size_t)INT_MAX), r;
+  int maxlen = min<int64_t>(content_length_ - content_->size(), 1048576), r;
   
  RETRY:
   if ((r = read(fd, content_->prepare(maxlen), maxlen)) == 0) {
@@ -278,11 +281,19 @@ void hq_client::send_file_response(int status, const string& msg, const hq_heade
 
 bool hq_client::open_response(int status, const string& msg, const hq_headers& headers, const char* data, size_t len)
 {
-  // TODO check content-length and content-encoding to privent res. splitting
   _prepare_response(status, msg, headers, -1);
   res_.closed_by_sender = false;
   if (len != 0) {
-    res_.sendbuf.push(data, len);
+    switch (res_.mode) {
+    case RESPONSE_MODE_SIMPLE:
+      res_.sendbuf.push(data, len);
+      break;
+    case RESPONSE_MODE_CHUNKED:
+      _push_chunked_data(data, len);
+      break;
+    default:
+      assert(0);
+    }
   }
   return _write_sendbuf(true);
 }
@@ -297,16 +308,7 @@ bool hq_client::send_response(const char* data, size_t len)
     res_.sendbuf.push(data, len);
     break;
   case RESPONSE_MODE_CHUNKED:
-    while (len != 0) {
-      unsigned chunk_len = (unsigned)min(len, (size_t)1048576);
-      char buf[16];
-      sprintf(buf, "%u\r\n", chunk_len);
-      res_.sendbuf.push(buf, strlen(buf));
-      res_.sendbuf.push(data, chunk_len);
-      res_.sendbuf.push("\r\n", 2);
-      data += chunk_len;
-      len -= chunk_len;
-    }
+    _push_chunked_data(data, len);
     break;
   default:
     assert(0);
@@ -320,7 +322,7 @@ void hq_client::close_response()
   case RESPONSE_MODE_SIMPLE:
     break;
   case RESPONSE_MODE_CHUNKED:
-    res_.sendbuf.push("0\r\n", 3);
+    res_.sendbuf.push("0\r\n\r\n", 5);
     if (! _write_sendbuf(true)) {
       _finalize_response(false);
       return;
@@ -383,7 +385,7 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
   for (hq_headers::const_iterator i = headers.begin();
        i != headers.end();
        ++i) {
-    const static string connection("connection"),
+    const static hq_util::lcstr connection("connection"),
       content_length("content-length");
     if (hq_util::lceq(i->first, connection)) {
       // skip
@@ -402,9 +404,9 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
     for (hq_headers::const_iterator i = req_.headers().begin();
 	 i != req_.headers().end();
 	 ++i) {
-      const static string connection("connection");
+      const static hq_util::lcstr connection("connection");
       if (hq_util::lceq(i->first, connection)) {
-	const static string keep_alive("keep-alive");
+	const static hq_util::lcstr keep_alive("keep-alive");
 	if (! hq_util::lceq(i->second, keep_alive)) {
 	  can_keep_alive = false;
 	}
@@ -415,7 +417,7 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
   if (res_.mode == RESPONSE_MODE_SIMPLE && can_keep_alive
       && ! have_content_length) {
     // use chunked encoding
-    res_.sendbuf.push("Content-Encoding: chunked\r\n");
+    res_.sendbuf.push("Transfer-Encoding: chunked\r\n");
     res_.mode = RESPONSE_MODE_CHUNKED;
   }
   keep_alive_ = can_keep_alive;
@@ -524,6 +526,20 @@ bool hq_client::_write_sendbuf(bool disactivate_poll_when_empty)
   return true;
 }
 
+void hq_client::_push_chunked_data(const char* data, size_t len)
+{
+  while (len != 0) {
+    unsigned chunk_len = (unsigned)min(len, (size_t)1048576);
+    char buf[16];
+    sprintf(buf, "%u\r\n", chunk_len);
+    res_.sendbuf.push(buf, strlen(buf));
+    res_.sendbuf.push(data, chunk_len);
+    res_.sendbuf.push("\r\n", 2);
+    data += chunk_len;
+    len -= chunk_len;
+  }
+}
+
 hq_worker::handler::handler()
   : junction_(NULL)
 {
@@ -569,7 +585,7 @@ void hq_worker::handler::_start_worker_or_register(hq_worker* worker)
 }
 
 hq_worker::hq_worker(int fd, const hq_req_reader&)
-  : fd_(fd), req_(NULL), res_sender_(NULL), buf_()
+  : fd_(fd), req_(NULL), res_sender_(NULL), buf_(), keep_alive_(true)
 {
   picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
   buf_.push("HTTP/1.1 101 Upgrade\r\n"
@@ -608,6 +624,9 @@ void hq_worker::_send_upgrade(int fd, int revents)
 
 void hq_worker::_prepare_next()
 {
+  assert(req_ == NULL);
+  assert(res_sender_ == NULL);
+  
   picoev_set_events(hq_loop::get_loop(), fd_, 0);
   // fetch the request immediately or register myself to dispatcher
   handler_._start_worker_or_register(this);
@@ -623,15 +642,20 @@ void hq_worker::_start(const hq_req_reader* req, hq_res_sender* res_sender)
   buf_.push(req_->method());
   buf_.push(' ');
   buf_.push(req_->path());
-  buf_.push(" HTTP/1.0\r\n", sizeof(" HTTP/1.0\r\n") - 1);
+  buf_.push(" HTTP/1.1\r\n", sizeof(" HTTP/1.1\r\n") - 1);
+  buf_.push("Connection: keep-alive\r\n");
   for (hq_headers::const_iterator i = req_->headers().begin();
        i != req_->headers().end();
        ++i) {
-    // TODO sanitize the headers?
-    buf_.push(i->first);
-    buf_.push(": ", 2);
-    buf_.push(i->second);
-    buf_.push("\r\n", 2);
+    static const hq_util::lcstr connection("connection");
+    if (hq_util::lceq(i->first, connection)) {
+      // skip
+    } else {
+      buf_.push(i->first);
+      buf_.push(": ", 2);
+      buf_.push(i->second);
+      buf_.push("\r\n", 2);
+    }
   }
   buf_.push("\r\n", 2);
   
@@ -720,20 +744,98 @@ void hq_worker::_read_response_header(int fd, int revents)
     }
     // got response
     msg = string(msg_p, msg_len);
+    keep_alive_ = minor_version >= 1;
+    res_.mode = RESPONSE_MODE_HTTP10;
+    res_.u.http10.content_length = -1;
     for (size_t i = 0; i < num_headers; ++i) {
-      // TODO prune headers
-      hdrs.push_back(make_pair(string(headers[i].name,
-				      headers[i].name + headers[i].name_len),
-			       string(headers[i].value,
-				      headers[i].value + headers[i].value_len)));
+      static const hq_util::lcstr connection("connection");
+      if (hq_util::lceq(headers[i].name, headers[i].name_len, connection)) {
+	static const hq_util::lcstr keep_alive("keep-alive");
+	keep_alive_ = hq_util::lceq(headers[i].value, headers[i].value_len,
+				    keep_alive);
+      } else {
+	static const hq_util::lcstr transfer_encoding("transfer-encoding"),
+	  content_length("content-length");
+	if (hq_util::lceq(headers[i].name, headers[i].name_len,
+			  transfer_encoding)) {
+	  static const hq_util::lcstr chunked("chunked");
+	  if (hq_util::lceq(headers[i].value, headers[i].value_len, chunked)) {
+	    res_.mode = RESPONSE_MODE_CHUNKED;
+	  } else {
+	    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+			     << " received unknown transfer-encoding: \""
+			     << string(headers[i].value, headers[i].value_len)
+			     << "\" from worker, closing";
+	    _return_error(500, "worker response error");
+	    goto CLOSE;
+	  }
+	} else if (hq_util::lceq(headers[i].name, headers[i].name_len,
+				 content_length)) {
+	  res_.mode = RESPONSE_MODE_HTTP10;
+	  if ((res_.u.http10.content_length =
+	       hq_util::parse_positive_number(headers[i].value,
+					      headers[i].value_len))
+	      == -1) {
+	    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
+			     << (" worker returned an invalid content-length"
+				 " header, closing");
+	    _return_error(500, "worker response error");
+	    goto CLOSE;
+	  }
+	}
+	hdrs.push_back(make_pair(string(headers[i].name,
+					headers[i].name + headers[i].name_len),
+				 string(headers[i].value,
+					headers[i].value
+					+ headers[i].value_len)));
+      }
     }
     buf_.advance(r);
   }
-  // TODO check content boundary, etc.
-  if (! res_sender_->open_response(status, msg, hdrs, buf_.buffer(),
-				   buf_.size())) {
-    res_sender_ = NULL;
+  
+  // adjust keep-alive-related flags
+  if (res_.mode == RESPONSE_MODE_HTTP10 && res_.u.http10.content_length == -1) {
+    keep_alive_ = false;
   }
+  // open the response handler
+  switch (res_.mode) {
+  case RESPONSE_MODE_HTTP10:
+    {
+      int64_t send_len = buf_.size();
+      if (res_.u.http10.content_length != -1) {
+	send_len = min(send_len, res_.u.http10.content_length);
+      }
+      if (! res_sender_->open_response(status, msg, hdrs, buf_.buffer(),
+				       send_len)) {
+	req_ = NULL;
+	res_sender_ = NULL;
+      }
+      buf_.advance(send_len);
+      res_.u.http10.off = send_len;
+      if (res_.u.http10.content_length != -1
+	  && res_.u.http10.off == res_.u.http10.content_length) {
+	if (res_sender_ != NULL) {
+	  res_sender_->close_response();
+	  req_ = NULL;
+	  res_sender_ = NULL;
+	}
+	if (! buf_.empty()) {
+	  picolog::warn() << picolog::mem_fun(hq_util::gethostof, fd)
+			   << " worker sent too many bytes of data, closing";
+	  goto CLOSE;
+	}
+	_prepare_next();
+	return;
+      }
+    }
+    break;
+  case RESPONSE_MODE_CHUNKED:
+    assert(0); // TODO
+    break;
+  default:
+    assert(0);
+  }
+  
   buf_.clear();
   picoev_set_callback(hq_loop::get_loop(), fd_,
 		      hq_picoev_cb<hq_worker, &hq_worker::_read_response_body>,
@@ -750,7 +852,7 @@ void hq_worker::_read_response_body(int fd, int revents)
   assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
   
   char* buf = buf_.prepare(READ_MAX);
-  int r;
+  ssize_t r, send_len;
   
  RETRY:
   if ((r = read(fd_, buf, READ_MAX)) == 0) {
@@ -769,12 +871,35 @@ void hq_worker::_read_response_body(int fd, int revents)
     }
   }
   // got data
+  send_len = r;
+  if (res_.u.http10.content_length != -1) {
+    send_len = (ssize_t)min((int64_t)send_len, res_.u.http10.content_length);
+  }
   if (res_sender_ != NULL) {
-    if (! res_sender_->send_response(buf, r)) {
+    if (! res_sender_->send_response(buf, send_len)) {
+      req_ = NULL;
       res_sender_ = NULL;
     }
   }
-  
+  res_.u.http10.off += send_len;
+  if (res_.u.http10.content_length != -1
+      && res_.u.http10.off == res_.u.http10.content_length) {
+    if (res_sender_ != NULL) {
+      res_sender_->close_response();
+      req_ = NULL;
+      res_sender_ = NULL;
+    }
+    if (send_len != r) {
+      picolog::warn() << picolog::mem_fun(hq_util::gethostof, fd)
+		      << " worker sent too many bytes of data, closing";
+      keep_alive_ = false;
+    }
+    if (keep_alive_) {
+      _prepare_next();
+      return;
+    }
+    goto CLOSE;
+  }
   return;
   
  CLOSE:
@@ -1112,11 +1237,22 @@ string hq_util::strerror(int err)
   return buf;
 }
 
+inline int lc(int c)
+{
+  return 'A' <= c && c <= 'Z' ? c + 0x20 : c;
+}
+
+hq_util::lcstr::lcstr(const string& s)
+{
+  for (string::const_iterator i = s.begin(); i != s.end(); ++i) {
+    this->s.push_back(lc(*i));
+  }
+}
+
 bool hq_util::lceq(const char* x, const char* y)
 {
-#define LC(c) ('A' <= c && c <= 'Z' ? c + 0x20 : c)
   for (; *x != '\0'; x++, y++)
-    if (LC(*x) != LC(*y))
+    if (lc(*x) != lc(*y))
       return false;
   return *y == '\0';
 }
@@ -1124,6 +1260,43 @@ bool hq_util::lceq(const char* x, const char* y)
 bool hq_util::lceq(const string& x, const string& y)
 {
   return x.size() == y.size() && lceq(x.c_str(), y.c_str());
+}
+
+bool hq_util::lceq(const char* x, const lcstr& y)
+{
+  for (string::const_iterator yi = y->begin(); yi != y->end(); ++x, ++yi)
+    if (lc(*x) != *yi)
+      return false;
+  return *x == '\0';
+}
+
+bool hq_util::lceq(const string& x, const lcstr& y)
+{
+  return x.size() == y->size() && lceq(x.c_str(), y);
+}
+
+bool hq_util::lceq(const char* x, size_t xlen, const lcstr& y)
+{
+  if (xlen != y->size())
+    return false;
+  for (string::const_iterator yi = y->begin(); yi != y->end(); ++yi)
+    if (lc(*x++) != *yi)
+      return false;
+  return true;
+}
+
+int64_t hq_util::parse_positive_number(const char* str, size_t len)
+{
+  int64_t r = 0;
+  
+  for (const char* p = str, * pMax = str + len; p != pMax; ++p) {
+    if ('0' <= *p && *p <= '9') {
+      r = r * 10 + *p - '0';
+    } else {
+      return -1;
+    }
+  }
+  return r;
 }
 
 struct hq_help : public picoopt::config_base<hq_help> {

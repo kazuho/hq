@@ -172,7 +172,7 @@ protected:
   int minor_version_;
   hq_headers headers_;
   hq_buffer* content_;
-  size_t content_length_;
+  int64_t content_length_;
   enum {
     READ_REQUEST,
     READ_CONTENT,
@@ -317,6 +317,7 @@ protected:
   void _write_sendfile_cb(int fd, int revents);
   void _write_sendbuf_cb(int fd, int revents);
   bool _write_sendbuf(bool disactivate_poll_when_empty);
+  void _push_chunked_data(const char* data, size_t len);
 };
 
 /**
@@ -366,11 +367,29 @@ public:
      */
     void _start_worker_or_register(hq_worker* worker);
   };
+  enum response_mode {
+    RESPONSE_MODE_HTTP10, // content-length or non-persistent
+    RESPONSE_MODE_CHUNKED
+  };
 protected:
   int fd_;
   const hq_req_reader* req_;
   hq_res_sender* res_sender_;
   hq_buffer buf_; // used for both send and recv
+  bool keep_alive_;
+  struct {
+    response_mode mode;
+    union {
+      struct {
+	int64_t off;
+	int64_t content_length; // -1 if no content-length
+      } http10;
+      struct {
+	int64_t chunk_off;
+	int64_t chunk_size;
+      } chunked;
+    } u;
+  } res_;
 public:
   /**
    * constructor
@@ -504,8 +523,18 @@ public:
   static std::string get_ext(const std::string& path);
   static std::string gethostof(int fd);
   static std::string strerror(int err);
+  struct lcstr {
+    std::string s;
+    explicit lcstr(const std::string& s);
+    const std::string* operator*() const { return &s; }
+    const std::string* operator->() const { return &s; }
+  };
   static bool lceq(const char* x, const char* y);
   static bool lceq(const std::string& x, const std::string& y);
+  static bool lceq(const char* x, const lcstr& y);
+  static bool lceq(const std::string& x, const lcstr& y);
+  static bool lceq(const char* x, size_t xlen, const lcstr& y);
+  static int64_t parse_positive_number(const char* str, size_t len);
 };
 
 #endif
