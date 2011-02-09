@@ -5,8 +5,6 @@
 
 using namespace std;
 
-template <typename T> void ignore_result(T) {}
-
 void picolog::_init(int level)
 {
   ss_ = new ostringstream();
@@ -17,7 +15,11 @@ void picolog::_flush()
 {
   *ss_ << endl;
   string s = ss_->str();
-  ignore_result(write(fd_, s.c_str(), (ssize_t)s.size()));
+  ssize_t r = write(fd_, s.c_str(), (ssize_t)s.size());
+  if (r != (ssize_t)s.size()) {
+    perror("log output error, write(2) failed");
+    exit(127);
+  }
   delete ss_;
 }
 
