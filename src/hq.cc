@@ -549,7 +549,7 @@ void hq_client::_push_chunked_data(const char* data, size_t len)
   while (len != 0) {
     unsigned chunk_len = (unsigned)min(len, (size_t)1048576);
     char buf[16];
-    sprintf(buf, "%u\r\n", chunk_len);
+    sprintf(buf, "%x\r\n", chunk_len);
     res_.sendbuf.push(buf, strlen(buf));
     res_.sendbuf.push(data, chunk_len);
     res_.sendbuf.push("\r\n", 2);
