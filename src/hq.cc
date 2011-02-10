@@ -224,8 +224,9 @@ void hq_handler::send_error(const hq_req_reader& req, hq_res_sender* res_sender,
 hq_client::hq_client(int fd)
   : fd_(fd), req_()
 {
+  ++*cac_mutex_t<size_t>::lockref(cnt_);
   picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
-  _reset();
+  _reset(false);
 }
 
 hq_client::~hq_client()
@@ -234,9 +235,10 @@ hq_client::~hq_client()
     picoev_del(hq_loop::get_loop(), fd_);
   }
   close(fd_);
+  --*cac_mutex_t<size_t>::lockref(cnt_);
 }
 
-void hq_client::_reset()
+void hq_client::_reset(bool is_keep_alive)
 {
   req_.reset();
   res_.status = 0;
@@ -245,12 +247,19 @@ void hq_client::_reset()
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_READ);
   picoev_set_callback(hq_loop::get_loop(), fd_,
 		      hq_picoev_cb<hq_client, &hq_client::_read_request>, NULL);
+  if (is_keep_alive) {
+    hq_loop::register_stoppable(this);
+  }
 }
 
 void hq_client::_read_request(int fd, int revents)
 {
   assert(fd == fd_);
   assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
+  
+  if (req_.empty()) {
+    hq_loop::unregister_stoppable(this);
+  }
   
   // read request
   if (! req_.read_request(fd_)) {
@@ -426,6 +435,10 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
     res_.sendbuf.push("Transfer-Encoding: chunked\r\n");
     res_.mode = RESPONSE_MODE_CHUNKED;
   }
+  // override the keep-alive flag after deciding the transfer method
+  if (hq_loop::stop_requested()) {
+    keep_alive_ = false;
+  }
   res_.sendbuf.push(keep_alive_
 		    ? "Connection: keep-alive\r\n"
 		    : "Connection: close\r\n");
@@ -439,7 +452,7 @@ void hq_client::_finalize_response(bool success)
 			     req_.minor_version(), res_.status);
   }
   if (success && keep_alive_) {
-    _reset();
+    _reset(true);
   } else {
     delete this;
   }
@@ -553,6 +566,13 @@ void hq_client::_push_chunked_data(const char* data, size_t len)
   }
 }
 
+void hq_client::from_loop_request_stop()
+{
+  delete this;
+}
+
+cac_mutex_t<size_t> hq_client::cnt_(NULL);
+
 hq_worker::handler::handler()
   : junction_(NULL)
 {
@@ -600,6 +620,7 @@ void hq_worker::handler::_start_worker_or_register(hq_worker* worker)
 hq_worker::hq_worker(int fd, const hq_req_reader&)
   : fd_(fd), req_(NULL), res_sender_(NULL), buf_(), keep_alive_(true)
 {
+  ++*cac_mutex_t<size_t>::lockref(cnt_);
   picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
   buf_.push("HTTP/1.1 101 Upgrade\r\n"
 	    "Upgrade: HTTPWORKER/0.9\r\n\r\n");
@@ -612,6 +633,7 @@ hq_worker::~hq_worker()
   assert(res_sender_ == NULL);
   picoev_del(hq_loop::get_loop(), fd_);
   close(fd_);
+  --*cac_mutex_t<size_t>::lockref(cnt_);
 }
 
 void hq_worker::_send_upgrade(int fd, int revents)
@@ -1088,6 +1110,7 @@ void hq_worker::_push_chunked_data()
   delete this;
 }
 
+cac_mutex_t<size_t> hq_worker::cnt_(NULL);
 hq_worker::handler hq_worker::handler_;
 
 void hq_worker::setup()
@@ -1134,7 +1157,7 @@ int hq_listener::config::setup(const string* hostport, string& err)
   setup_sock(fd);
   r = listen(fd, SOMAXCONN);
   assert(r == 0);
-  new hq_listener(fd);
+  listeners_.push_back(new hq_listener(fd));
   
   called_cnt_++;
   return 0;
@@ -1173,15 +1196,20 @@ hq_listener::poll_guard::~poll_guard()
        i != listeners_.end();
        ++i) {
     picoev_del(hq_loop::get_loop(), (*i)->listen_fd_);
+    // TODO we need to continue accepting workers if there are any pending clients
+    if (hq_loop::stop_requested()) {
+      delete *i;
+    }
+  }
+  if (hq_loop::stop_requested()) {
+    listeners_.clear();
   }
   pthread_mutex_unlock(&hq_listener::listeners_mutex_);
 }
 
-hq_listener::hq_listener(int listen_fd)
-  : listen_fd_(listen_fd)
+hq_listener::~hq_listener()
 {
-  mutex_guard mg(&listeners_mutex_);
-  listeners_.push_back(this);
+  close(listen_fd_);
 }
 
 void hq_listener::_accept(int fd, int revents)
@@ -1212,13 +1240,23 @@ hq_loop::~hq_loop()
 
 void hq_loop::run_loop()
 {
-  while (1) {
-    hq_listener::poll_guard pg;
-    picoev_loop_once(*loop_, TIMEOUT_SECS);
+  while (hq_listener::num_listeners() != 0
+	 || *cac_mutex_t<size_t>::lockref(hq_client::cnt_) != 0) {
+    {
+      hq_listener::poll_guard pg;
+      picoev_loop_once(*loop_, 1);
+    }
+    if (stop_) {
+      while (! stoppables_->empty()) {
+	(*stoppables_->begin())->from_loop_request_stop();
+      }
+    }
   }
 }
 
 hq_tls<picoev_loop*> hq_loop::loop_;
+hq_tls<set<hq_loop::stoppable*> > hq_loop::stoppables_;
+volatile bool hq_loop::stop_;
 
 hq_static_handler::config::config()
   : picoopt::config_base<config>("static", required_argument,
@@ -1444,7 +1482,7 @@ int64_t hq_util::parse_positive_number(const char* str, size_t len)
 
 struct hq_help : public picoopt::config_base<hq_help> {
   hq_help()
-    : picoopt::config_base<hq_help>("help", no_argument, "  print this help")
+    : picoopt::config_base<hq_help>("help", no_argument, "")
   {}
   virtual int setup(const string*, string&) {
     picoopt::print_help(stdout, "HQ - a queue-based HTTP server");
@@ -1474,8 +1512,46 @@ struct hq_log_level : public picoopt::config_base<hq_log_level> {
   }
 };
 
+static int num_threads = 1;
+
+struct hq_num_threads : public picoopt::config_base<hq_num_threads> {
+  hq_num_threads()
+    : picoopt::config_base<hq_num_threads>("num-threads", required_argument,
+					   "=num_threads")
+    {}
+  virtual int setup(const string* num, string& err) {
+    if (sscanf(num->c_str(), "%d", &num_threads) != 1 || num_threads < 1) {
+      err = "invalid argument";
+      return 1;
+    }
+    return 0;
+  }
+};
+
+static void* loop_main(void*)
+{
+  hq_loop loop;
+  loop.run_loop();
+  return NULL;
+}
+
+static void on_signal(int sig)
+{
+  switch (sig) {
+  case SIGTERM:
+    picolog::info() << "received SIGTERM, quitting";
+    hq_loop::request_stop();
+    break;
+  default:
+    assert(0);
+  }
+}
+
 int main(int argc, char** argv)
 {
+  signal(SIGPIPE, SIG_IGN);
+  signal(SIGTERM, on_signal);
+  
   picoev_init(MAX_FDS);
   
   int r;
@@ -1487,8 +1563,26 @@ int main(int argc, char** argv)
   
   hq_worker::setup();
   
-  hq_loop loop;
-  loop.run_loop();
+  if (num_threads == 1) {
+    loop_main(NULL);
+  } else {
+    vector<pthread_t> threads;
+    // start loop(s)
+    for (int i = 0; i < num_threads; ++i) {
+      threads.push_back(0);
+      int err = pthread_create(&threads.back(), NULL, loop_main, NULL);
+      if (err != 0) {
+	perror("pthread_create failed");
+	exit(2);
+      }
+    }
+    // wait until all threads exit
+    for (vector<pthread_t>::iterator i = threads.begin();
+	 i != threads.end();
+	 ++i) {
+      pthread_join(*i, NULL);
+    }
+  }
   
   return 0;
 }

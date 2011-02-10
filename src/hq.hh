@@ -7,6 +7,7 @@ extern "C" {
 }
 #include <cstdio>
 #include <list>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,8 +33,8 @@ public:
   }
   const T& operator*() const { return *_get(); }
   T& operator*() { return *_get(); }
-  const T& operator->() const { return *_get(); }
-  T& operator->() { return *_get(); }
+  const T* operator->() const { return _get(); }
+  T* operator->() { return _get(); }
 protected:
   T* _get() {
     T* t = reinterpret_cast<T*>(pthread_getspecific(key_));
@@ -161,6 +162,42 @@ private:
   hq_buffer& operator=(const hq_buffer&); // not used
 };
 
+class hq_loop {
+public:
+  class stoppable {
+    friend class hq_loop;
+  protected:
+    ~stoppable() {}
+    virtual void from_loop_request_stop() = 0;
+  };
+public:
+  /**
+   * constructor
+   */
+  hq_loop();
+  /**
+   * desctructor
+   */
+  ~hq_loop();
+  /**
+   * main loop
+   */
+  void run_loop();
+private:
+  hq_loop(const hq_loop&); // not used
+  hq_loop& operator=(const hq_loop&); // not used
+protected:
+  static hq_tls<picoev_loop*> loop_;
+  static hq_tls<std::set<stoppable*> > stoppables_;
+  static volatile bool stop_;
+public:
+  static picoev_loop* get_loop() { return *loop_; }
+  static bool stop_requested() { return stop_; }
+  static void request_stop() { stop_ = true; }
+  static void register_stoppable(stoppable* s) { stoppables_->insert(s); }
+  static void unregister_stoppable(stoppable* s) { stoppables_->erase(s); }
+};
+
 /**
  * reads a HTTP request
  */
@@ -200,6 +237,7 @@ public:
    * returns whether or not the entire request has been received
    */
   bool is_complete() const { return state_ == READ_COMPLETE; }
+  bool empty() const { return state_ == READ_REQUEST && buf_.empty(); }
   const std::string& method() const { return method_; }
   const std::string& path() const { return path_; }
   int minor_version() const { return minor_version_; }
@@ -273,7 +311,7 @@ public:
 /**
  * HTTP client
  */
-class hq_client : public hq_res_sender {
+class hq_client : public hq_res_sender, public hq_loop::stoppable {
 public:
   enum response_mode {
     RESPONSE_MODE_HTTP10, /* not chunked */
@@ -310,7 +348,7 @@ public:
    */
   virtual ~hq_client();
 protected:
-  void _reset();
+  void _reset(bool is_keep_alive);
   void _read_request(int fd, int revents);
   virtual void send_file_response(int status, const std::string& msg, const hq_headers& headers, int fd);
   virtual bool open_response(int status, const std::string& msg, const hq_headers& headers, const char* data, size_t len);
@@ -323,6 +361,12 @@ protected:
   bool _write_sendbuf(bool disactivate_poll_when_empty);
   void _push_http10_data(const char* data, size_t len);
   void _push_chunked_data(const char* data, size_t len);
+  virtual void from_loop_request_stop();
+private:
+  hq_client(const hq_client&); // not defined
+  hq_client& operator=(const hq_client&); // not defined
+public:
+  static cac_mutex_t<size_t> cnt_;
 };
 
 /**
@@ -417,6 +461,11 @@ protected:
   bool _send_buffer();
   bool _recv_buffer(bool* closed = NULL);
   void _push_chunked_data();
+private:
+  hq_worker(const hq_worker&); // not defined
+  hq_worker& operator=(const hq_worker&); // not defined
+public:
+  static cac_mutex_t<size_t> cnt_;
 protected:
   static handler handler_;
 public:
@@ -444,38 +493,17 @@ public:
 protected:
   int listen_fd_;
 protected:
-  hq_listener(int listen_fd);
   void _accept(int fd, int revents);
 private:
+  hq_listener(int listen_fd) : listen_fd_(listen_fd) {}
   hq_listener(const hq_listener&); // not defined
-  ~hq_listener(); // TODO implement
+  ~hq_listener();
   hq_listener& operator=(const hq_listener&); // not defined
 protected:
   static std::list<hq_listener*> listeners_;
   static pthread_mutex_t listeners_mutex_;
-};
-
-class hq_loop {
 public:
-  /**
-   * constructor
-   */
-  hq_loop();
-  /**
-   * desctructor
-   */
-  ~hq_loop();
-  /**
-   * main loop
-   */
-  void run_loop();
-private:
-  hq_loop(const hq_loop&); // not used
-  hq_loop& operator=(const hq_loop&); // not used
-protected:
-  static hq_tls<picoev_loop*> loop_;
-public:
-  static picoev_loop* get_loop() { return *loop_; }
+  static size_t num_listeners() { return listeners_.size(); }
 };
 
 class hq_static_handler : public hq_handler {
