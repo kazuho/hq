@@ -1129,8 +1129,7 @@ static void setup_sock(int fd)
 
 hq_listener::config::config()
   : picoopt::config_base<config>("port", required_argument,
-				 "=[host:]port"),
-    called_cnt_(0)
+				 "=[host:]port")
 {
 }
 
@@ -1159,13 +1158,12 @@ int hq_listener::config::setup(const string* hostport, string& err)
   assert(r == 0);
   listeners_.push_back(new hq_listener(fd));
   
-  called_cnt_++;
   return 0;
 }
 
 int hq_listener::config::post_setup(string& err)
 {
-  if (called_cnt_ < 1) {
+  if (hq_listener::listeners_.empty()) {
     err = "should be set more than once";
     return 1;
   }

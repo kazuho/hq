@@ -51,6 +51,9 @@ protected:
   }
 };
 
+/**
+ * RAII for locking/unlocking a mutex
+ */
 class mutex_guard {
 protected:
   pthread_mutex_t* m_;
@@ -162,12 +165,24 @@ private:
   hq_buffer& operator=(const hq_buffer&); // not used
 };
 
+/**
+ * the event loop
+ */
 class hq_loop {
 public:
+  /**
+   * objects that can unregister itself from the event loop should implement
+   * this interface
+   */
   class stoppable {
     friend class hq_loop;
   protected:
     ~stoppable() {}
+    /**
+     * called when the loop is requested to exit.  The called object should
+     * unregister itself by calling unregister_stoppable and perform other
+     * cleanup tasks.
+     */
     virtual void from_loop_request_stop() = 0;
   };
 public:
@@ -191,10 +206,25 @@ protected:
   static hq_tls<std::set<stoppable*> > stoppables_;
   static volatile bool stop_;
 public:
+  /**
+   * returns the picoev_loop of the current thread
+   */
   static picoev_loop* get_loop() { return *loop_; }
+  /**
+   * returns if stop is requested
+   */
   static bool stop_requested() { return stop_; }
+  /**
+   * requests all of the loops to stop
+   */
   static void request_stop() { stop_ = true; }
+  /**
+   * registers a stoppable object to the loop
+   */
   static void register_stoppable(stoppable* s) { stoppables_->insert(s); }
+  /**
+   * unregisters a stoppable object from the loop
+   */
   static void unregister_stoppable(stoppable* s) { stoppables_->erase(s); }
 };
 
@@ -237,12 +267,33 @@ public:
    * returns whether or not the entire request has been received
    */
   bool is_complete() const { return state_ == READ_COMPLETE; }
+  /**
+   * returns true if not a single byte has been read by the parser
+   */
   bool empty() const { return state_ == READ_REQUEST && buf_.empty(); }
+  /**
+   * returns the method
+   */
   const std::string& method() const { return method_; }
+  /**
+   * returns path
+   */
   const std::string& path() const { return path_; }
+  /**
+   * returns minor version of the HTTP protocl being used
+   */
   int minor_version() const { return minor_version_; }
+  /**
+   * returns the request headers
+   */
   const hq_headers& headers() const { return headers_; }
+  /**
+   * returns the request content (or null if none)
+   */
   const hq_buffer* content() const { return content_; }
+  /**
+   * returns length of the request content
+   */
   size_t content_length() const { return content_length_; }
 protected:
   bool _read_request(int fd);
@@ -475,8 +526,6 @@ public:
 class hq_listener {
 public:
   class config : public picoopt::config_base<config> {
-  protected:
-    size_t called_cnt_;
   public:
     config();
     virtual int setup(const std::string* hostport, std::string& err);
@@ -503,6 +552,9 @@ protected:
   static std::list<hq_listener*> listeners_;
   static pthread_mutex_t listeners_mutex_;
 public:
+  /**
+   * returns number of the listeners
+   */
   static size_t num_listeners() { return listeners_.size(); }
 };
 
@@ -544,7 +596,13 @@ public:
 protected:
   FILE* fp_;
 public:
+  /**
+   * destructor
+   */
   ~hq_log_access();
+  /**
+   * logs an HTTP access
+   */
   void log(int fd, const std::string& method, const std::string& path, int minor_version, int status);
 protected:
   hq_log_access(FILE* fp) : fp_(fp) {}
@@ -554,22 +612,59 @@ public:
 
 class hq_util {
 public:
+  /**
+   * return mime type assigned to the given extension
+   */
   static std::string get_mime_type(const std::string& ext);
+  /**
+   * returns the extension portion of given path (excluding the ".") or an
+   * empty string if not any
+   */
   static std::string get_ext(const std::string& path);
+  /**
+   * returns the peer IP address as string
+   */
   static std::string gethostof(int fd);
+  /**
+   * wrapper of strerror_r(3)
+   */
   static std::string strerror(int err);
+  /**
+   * lower-case string class used for fast comparison
+   */
   struct lcstr {
     std::string s;
     explicit lcstr(const std::string& s);
     const std::string* operator*() const { return &s; }
     const std::string* operator->() const { return &s; }
   };
+  /**
+   * checks if two strings are identical in lower-case (US-ascii only)
+   */
   static bool lceq(const char* x, const char* y);
+  /**
+   * checks if two strings are identical in lower-case (US-ascii only)
+   */
   static bool lceq(const std::string& x, const std::string& y);
+  /**
+   * checks if two strings are identical in lower-case (US-ascii only)
+   */
   static bool lceq(const char* x, const lcstr& y);
+  /**
+   * checks if two strings are identical in lower-case (US-ascii only)
+   */
   static bool lceq(const std::string& x, const lcstr& y);
+  /**
+   * checks if two strings are identical in lower-case (US-ascii only)
+   */
   static bool lceq(const char* x, size_t xlen, const lcstr& y);
+  /**
+   * finds a header with given name from the header list
+   */
   static hq_headers::const_iterator find_header(const hq_headers& headers, const lcstr& name);
+  /**
+   * parses a decimal number or returns -1 on error
+   */
   static int64_t parse_positive_number(const char* str, size_t len);
 };
 
