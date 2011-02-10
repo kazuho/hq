@@ -76,8 +76,10 @@ hq_req_reader::_read_request(int fd)
  RETRY:
   if ((r = read(fd, buf_.prepare(READ_MAX), READ_MAX)) == 0) {
     // closed by peer
-    picolog::info() << picolog::mem_fun(hq_util::gethostof, fd)
-		    << " closed by peer while reading the request";
+    if (! buf_.empty()) {
+      picolog::info() << picolog::mem_fun(hq_util::gethostof, fd)
+		      << " closed by peer while reading the request";
+    }
     return false;
   } else if (r == -1) { // error
     if (errno == EINTR) {
@@ -386,13 +388,15 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
     res_.sendbuf.push(buf, strlen(buf));
     have_content_length = true;
   }
+  const static hq_util::lcstr connection("connection"),
+    keep_alive("keep-alive"), content_length("content-length"),
+    transfer_encoding("transfer-encoding");
   for (hq_headers::const_iterator i = headers.begin();
        i != headers.end();
        ++i) {
-    const static hq_util::lcstr connection("connection"),
-      content_length("content-length");
-    if (hq_util::lceq(i->first, connection)) {
-      // skip
+    if (hq_util::lceq(i->first, connection)
+	|| hq_util::lceq(i->first, transfer_encoding)) {
+      // skip transfer-related headers from worker
     } else {
       if (! have_content_length && hq_util::lceq(i->first, content_length)) {
 	have_content_length = true;
@@ -409,28 +413,19 @@ void hq_client::_prepare_response(int status, const string& msg, const hq_header
       res_.sendbuf.push("\r\n", 2);
     }
   }
-  bool can_keep_alive = have_content_length || req_.minor_version() >= 1;
-  if (can_keep_alive) {
-    for (hq_headers::const_iterator i = req_.headers().begin();
-	 i != req_.headers().end();
-	 ++i) {
-      const static hq_util::lcstr connection("connection");
-      if (hq_util::lceq(i->first, connection)) {
-	const static hq_util::lcstr keep_alive("keep-alive");
-	if (! hq_util::lceq(i->second, keep_alive)) {
-	  can_keep_alive = false;
-	}
-	break;
-      }
-    }
-  }
-  if (res_.mode == RESPONSE_MODE_HTTP10 && can_keep_alive
-      && ! have_content_length) {
+  hq_headers::const_iterator connection_header
+    = hq_util::find_header(req_.headers(), connection);
+  keep_alive_ = req_.minor_version() >= 1
+    ? (connection_header == req_.headers().end()
+       || hq_util::lceq(connection_header->second, keep_alive))
+    : (have_content_length
+       && connection_header != req_.headers().end()
+       && hq_util::lceq(connection_header->second, keep_alive));
+  if (keep_alive_ && ! have_content_length) {
     // use chunked encoding
     res_.sendbuf.push("Transfer-Encoding: chunked\r\n");
     res_.mode = RESPONSE_MODE_CHUNKED;
   }
-  keep_alive_ = can_keep_alive;
   res_.sendbuf.push(keep_alive_
 		    ? "Connection: keep-alive\r\n"
 		    : "Connection: close\r\n");
@@ -728,8 +723,8 @@ void hq_worker::_read_response_header(int fd, int revents)
     if (closed) {
       picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
 		       << " worker closed the connection";
-      _return_error(500, "connection closed by worker");
     }
+    _return_error(500, "connection closed by worker");
     goto CLOSE;
   }
 
