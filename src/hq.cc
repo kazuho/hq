@@ -723,28 +723,15 @@ void hq_worker::_read_response_header(int fd, int revents)
   string msg;
   hq_headers hdrs;
   
- RETRY:
-  if ((r = read(fd_, buf_.prepare(READ_MAX), READ_MAX)) == 0) {
-    // closed
-    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
-		     << " worker closed the connection";
-    _return_error(500, "connection closed by worker");
-    goto CLOSE;
-  } else if (r == -1) {
-    if (r == EINTR) {
-      goto RETRY;
-    } else if (r == EAGAIN || r == EWOULDBLOCK) {
-      return;
-    } else {
+  bool closed;
+  if (! _recv_buffer(&closed)) {
+    if (closed) {
       picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
-		       << " failed to read response from worker, "
-		       << hq_util::strerror(errno);
-      _return_error(500, "worker connection error");
-      goto CLOSE;
+		       << " worker closed the connection";
+      _return_error(500, "connection closed by worker");
     }
+    goto CLOSE;
   }
-  // read some bytes
-  buf_.adjust_size(r);
 
   { // try to parse the response
     const char* msg_p;
@@ -845,60 +832,91 @@ void hq_worker::_read_response_header(int fd, int revents)
 	_prepare_next();
 	return;
       }
+      buf_.clear();
+      picoev_set_callback(hq_loop::get_loop(), fd_,
+			  hq_picoev_cb<hq_worker,
+			               &hq_worker::_read_response_http10>,
+			  NULL);
     }
-    break;
+    return;
   case RESPONSE_MODE_CHUNKED:
-    assert(0); // TODO
-    break;
-  default:
-    assert(0);
+    res_.u.chunked.chunk_off = 0;
+    res_.u.chunked.chunk_size = -1;
+    if (! res_sender_->open_response(status, msg, hdrs, NULL, 0)) {
+      req_ = NULL;
+      res_sender_ = NULL;
+    }
+    picoev_set_callback(hq_loop::get_loop(), fd_,
+			hq_picoev_cb<hq_worker,
+			             &hq_worker::_read_response_chunked>,
+			NULL);
+    _push_chunked_data();
+    return;
   }
   
-  buf_.clear();
-  picoev_set_callback(hq_loop::get_loop(), fd_,
-		      hq_picoev_cb<hq_worker, &hq_worker::_read_response_body>,
-		      NULL);
+  assert(0);
   return;
   
  CLOSE:
   delete this;
 }
 
-void hq_worker::_read_response_body(int fd, int revents)
+bool hq_worker::_recv_buffer(bool* closed)
 {
-  assert(fd == fd_);
-  assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
+  if (closed != NULL) {
+    *closed = false;
+  }
   
   char* buf = buf_.prepare(READ_MAX);
-  ssize_t r, send_len;
+  ssize_t r;
   
  RETRY:
   if ((r = read(fd_, buf, READ_MAX)) == 0) {
-    // closed
-    goto CLOSE;
-  } else if (r == -1) {
-    if (r == EINTR) {
-      goto RETRY;
-    } else if (r == EAGAIN || r == EWOULDBLOCK) {
-      return;
-    } else {
-      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
-		       << " failed to read response content from worker, "
-		       << hq_util::strerror(errno);
-      goto CLOSE;
+    if (closed != NULL) {
+      *closed = true;
     }
+    // closed
+    return false;
+  } else if (r == -1) {
+    if (errno == EINTR) {
+      goto RETRY;
+    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      // ok
+    } else {
+      picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+		       << " got an I/O error while reading data from worker, "
+		       << hq_util::strerror(errno);
+      return false;
+    }
+  } else {
+    buf_.adjust_size(r);
   }
-  // got data
-  send_len = r;
-  if (res_.u.http10.content_length != -1) {
-    send_len = (ssize_t)min((int64_t)send_len, res_.u.http10.content_length);
+  
+  return true;
+}
+
+void hq_worker::_read_response_http10(int fd, int revents)
+{
+  assert(fd == fd_);
+  assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
+  assert(buf_.empty());
+  
+  size_t send_len;
+  
+  if (! _recv_buffer()) {
+    goto CLOSE;
   }
+  
+  send_len = res_.u.http10.content_length != -1
+    ? (size_t)min<int64_t>(buf_.size(), res_.u.http10.content_length)
+    : buf_.size();
   if (res_sender_ != NULL) {
-    if (! res_sender_->send_response(buf, send_len)) {
+    if (! res_sender_->send_response(buf_.buffer(), send_len)) {
       req_ = NULL;
       res_sender_ = NULL;
     }
   }
+  buf_.advance(send_len);
   res_.u.http10.off += send_len;
   if (res_.u.http10.content_length != -1
       && res_.u.http10.off == res_.u.http10.content_length) {
@@ -907,7 +925,7 @@ void hq_worker::_read_response_body(int fd, int revents)
       req_ = NULL;
       res_sender_ = NULL;
     }
-    if (send_len != r) {
+    if (! buf_.empty()) {
       picolog::warn() << picolog::mem_fun(hq_util::gethostof, fd)
 		      << " worker sent too many bytes of data, closing";
       keep_alive_ = false;
@@ -918,6 +936,8 @@ void hq_worker::_read_response_body(int fd, int revents)
     }
     goto CLOSE;
   }
+  
+  assert(buf_.empty());
   return;
   
  CLOSE:
@@ -929,6 +949,24 @@ void hq_worker::_read_response_body(int fd, int revents)
   delete this;
 }
 
+void hq_worker::_read_response_chunked(int fd, int revents)
+{
+  assert(fd == fd_);
+  assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
+  
+  if (! _recv_buffer()) {
+    if (res_sender_ != NULL) {
+      res_sender_->close_response();
+      req_ = NULL;
+      res_sender_ = NULL;
+    }
+    delete this;
+    return;
+  }
+  
+  _push_chunked_data();
+}
+    
 void hq_worker::_return_error(int status, const string& msg)
 {
   assert(res_sender_ != NULL);
@@ -955,6 +993,104 @@ bool hq_worker::_send_buffer()
   buf_.advance(r);
   
   return true;
+}
+
+void hq_worker::_push_chunked_data()
+{
+  while (1) {
+    
+    // handling of trailing bytes after chunked content
+    if (res_.u.chunked.chunk_off == res_.u.chunked.chunk_size) {
+      switch (res_.u.chunked.chunk_size) {
+      case -1: // is start, nothing to do
+	break;
+      default: // not at EOF, read trailing CRLF of current chunk
+	if (buf_.size() < 2) {
+	  return;
+	}
+	if (memcmp(buf_.buffer(), "\r\n", 2) != 0) {
+	  picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+			   << (" received a broken chunked content from worker,"
+			       " closing");
+	  keep_alive_ = false;
+	  goto CLOSE;
+	}
+	buf_.advance(2);
+	res_.u.chunked.chunk_size = -1;
+	break;
+      case 0: // EOF, skip until we find CRLFCRLF
+	// TODO add support for trailing headers? (ignored for the time being)
+	while (buf_.size() >= 4) {
+	  if (memcmp(buf_.buffer(), "\r\n\r\n", 4) == 0) {
+	    buf_.advance(4);
+	    goto CLOSE;
+	  }
+	  buf_.advance(1);
+	}
+	return;
+      }
+    }
+    
+    // read the chunk header
+    if (res_.u.chunked.chunk_size == -1) {
+      const char* crlf = strnstr(buf_.buffer(), "\r\n", buf_.size());
+      if (crlf == NULL) {
+	if (buf_.size() >= 65536) {
+	  picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+			   << " cannot handle chunk-ext over 64kb, closing";
+	  keep_alive_ = false;
+	  goto CLOSE;
+	}
+	return;
+      }
+      if (sscanf(buf_.buffer(), "%llx", &res_.u.chunked.chunk_size) != 1) {
+	picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+			 << (" received a broken chunked content from worker,"
+			     " closing");
+	keep_alive_ = false;
+	goto CLOSE;
+      }
+      res_.u.chunked.chunk_off = 0;
+      if (res_.u.chunked.chunk_size == 0) {
+	// for eof we keep the last CRLF to detect the end of trailing headers by CRLFCRLF, kinda nasty...
+	buf_.advance(crlf - buf_.buffer());
+	continue;
+      }
+      buf_.advance(crlf - buf_.buffer() + 2);
+    }
+    
+    // push the chunked body
+    while (res_.u.chunked.chunk_off < res_.u.chunked.chunk_size) {
+      if (buf_.size() == 0) {
+	return;
+      }
+      size_t sz = min<size_t>(min<int64_t>(res_.u.chunked.chunk_size
+					   - res_.u.chunked.chunk_off,
+					   1048576),
+			      buf_.size());
+      if (res_sender_ != NULL) {
+	if (! res_sender_->send_response(buf_.buffer(), sz)) {
+	  req_ = NULL;
+	  res_sender_ = NULL;
+	}
+      }
+      buf_.advance(sz);
+      res_.u.chunked.chunk_off += sz;
+    }
+    
+  }
+
+ CLOSE:
+  if (res_sender_ != NULL) {
+    res_sender_->close_response();
+    req_ = NULL;
+    res_sender_ = NULL;
+  }
+  if (keep_alive_) {
+    _prepare_next();
+    return;
+  }
+  delete this;
 }
 
 hq_worker::handler hq_worker::handler_;

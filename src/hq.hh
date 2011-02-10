@@ -390,8 +390,8 @@ protected:
 	int64_t content_length; // -1 if no content-length
       } http10;
       struct {
-	int64_t chunk_off;
-	int64_t chunk_size;
+	int64_t chunk_off;  // becomes chunk_off == chunk_size while waiting for trailing CRLFs
+	int64_t chunk_size; // -1 if not initialized
       } chunked;
     } u;
   } res_;
@@ -411,9 +411,12 @@ protected:
   void _send_request_cb(int fd, int revents);
   void _send_request();
   void _read_response_header(int fd, int revents);
-  void _read_response_body(int fd, int revents);
+  void _read_response_http10(int fd, int revents);
+  void _read_response_chunked(int fd, int revents);
   void _return_error(int status, const std::string& msg);
   bool _send_buffer();
+  bool _recv_buffer(bool* closed = NULL);
+  void _push_chunked_data();
 protected:
   static handler handler_;
 public:
