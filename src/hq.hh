@@ -525,11 +525,15 @@ public:
 
 class hq_listener {
 public:
-  class config : public picoopt::config_base<config> {
-  public:
+  struct config : public picoopt::config_base<config> {
     config();
     virtual int setup(const std::string* hostport, std::string& err);
     virtual int post_setup(std::string& err);
+  };
+  struct max_connections_config
+    : public picoopt::config_base<max_connections_config> {
+    max_connections_config();
+    virtual int setup(const std::string* maxconn, std::string& err);
   };
   class poll_guard {
   protected:
@@ -551,6 +555,7 @@ private:
 protected:
   static std::list<hq_listener*> listeners_;
   static pthread_mutex_t listeners_mutex_;
+  static int max_connections_;
 public:
   /**
    * returns number of the listeners

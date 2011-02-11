@@ -1170,11 +1170,42 @@ int hq_listener::config::post_setup(string& err)
   return 0;
 }
 
+hq_listener::max_connections_config::max_connections_config()
+  : picoopt::config_base<max_connections_config>("max-connections",
+						  required_argument, "=number")
+{
+}
+
+int hq_listener::max_connections_config::setup(const string* maxconn,
+					       string& err)
+{
+  if (sscanf(maxconn->c_str(), "%d", &max_connections_) != 1
+      || max_connections_ < 1) {
+    err= "argumentshould be a positive number";
+    return 1;
+  }
+  return 0;
+}
+
 hq_listener::poll_guard::poll_guard()
   : locked_(false)
 {
   if (pthread_mutex_trylock(&hq_listener::listeners_mutex_) != 0)
     return;
+  // TODO locking two objects using temporary variables, may cause deadlocks
+  if ((int)(*cac_mutex_t<size_t>::lockref(hq_worker::cnt_)
+	    + *cac_mutex_t<size_t>::lockref(hq_client::cnt_))
+      >= max_connections_) {
+    static time_t last_alert_at = 0;
+    time_t now;
+    time(&now);
+    if (last_alert_at + 10 <= now) {
+      picolog::warn() << "too many connection";
+      last_alert_at = now;
+    }
+    pthread_mutex_unlock(&hq_listener::listeners_mutex_);
+    return;
+  }
   // if the lock succeeded add the file descriptors to the poll list
   locked_ = true;
   for (list<hq_listener*>::iterator i = listeners_.begin();
@@ -1225,6 +1256,7 @@ void hq_listener::_accept(int fd, int revents)
 
 std::list<hq_listener*> hq_listener::listeners_;
 pthread_mutex_t hq_listener::listeners_mutex_ = PTHREAD_MUTEX_INITIALIZER;
+int hq_listener::max_connections_ = 151;
 
 hq_loop::hq_loop()
 {
