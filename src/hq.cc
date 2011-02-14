@@ -6,6 +6,7 @@ extern "C" {
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -478,7 +479,8 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
  RETRY:
   int r;
 #if HQ_IS_LINUX
-  r = sendfile(fd_, res_.u.sendfile.fd, &res_.sendfile.pos, 1048576);
+  r = sendfile(fd_, res_.u.sendfile.fd, &res_.u.sendfile.pos, 1048576);
+  if (r >= 0) r = 0; // for compat. w. bsd-style sendfile
 #elif HQ_IS_BSD
   {
     off_t len = min((off_t)1048576, res_.u.sendfile.size);
@@ -1050,8 +1052,10 @@ void hq_worker::_push_chunked_data()
     
     // read the chunk header
     if (res_.u.chunked.chunk_size == -1) {
-      const char* crlf = strnstr(buf_.buffer(), "\r\n", buf_.size());
-      if (crlf == NULL) {
+      const static char* CRLF = "\r\n";
+      const char* crlf = search(buf_.buffer(), buf_.buffer() + buf_.size(),
+				CRLF, CRLF + 2);
+      if (crlf == buf_.buffer() + buf_.size()) {
 	if (buf_.size() >= 65536) {
 	  picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
 			   << " cannot handle chunk-ext over 64kb, closing";
@@ -1060,12 +1064,16 @@ void hq_worker::_push_chunked_data()
 	}
 	return;
       }
-      if (sscanf(buf_.buffer(), "%llx", &res_.u.chunked.chunk_size) != 1) {
-	picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
-			 << (" received a broken chunked content from worker,"
-			     " closing");
-	keep_alive_ = false;
-	goto CLOSE;
+      {
+	long long unsigned t;
+	if (sscanf(buf_.buffer(), "%llx", &t) != 1) {
+	  picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+			   << (" received a broken chunked content from worker,"
+			       " closing");
+	  keep_alive_ = false;
+	  goto CLOSE;
+	}
+	res_.u.chunked.chunk_size = t;
       }
       res_.u.chunked.chunk_off = 0;
       if (res_.u.chunked.chunk_size == 0) {
