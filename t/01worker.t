@@ -7,71 +7,13 @@ use Test::More;
 use Test::TCP qw(empty_port);
 use Scope::Guard;
 
+require 't/lib.pl';
+
 my $port = $ENV{HQ_PORT} || empty_port();
-
-sub start_hq {
-    my $port = shift;
-    return undef if $ENV{HQ_PORT};
-    my $pid = fork;
-    die "fork failed:$!" unless defined $pid;
-    if ($pid == 0) {
-        exec "src/hq", "--port=$port", "--static=/static=t/assets/static";
-        die "exec failed:$!";
-    }
-    sleep 1;
-    Scope::Guard->new(sub { kill 9, $pid });
-}
-
-sub read_request {
-    my $sock = shift;
-    my $req = '';
-    while (my $l = <$sock>) {
-        $req .= $l;
-        last if $l eq "\r\n";
-    }
-    my %env;
-    my $r = parse_http_request($req, \%env);
-    return $r if $r < 0;
-    \%env;
-}
-
-sub read_response {
-    my $sock = shift;
-    my $res = '';
-    while (my $l = <$sock>) {
-        $res .= $l;
-        last if $l eq "\r\n";
-    }
-    my ($ret, $minor_version, $status, $message, $headers)
-        = parse_http_response($res, HEADERS_AS_ARRAYREF);
-    # lc and sort
-    $headers = [
-        sort {
-            $a->[0] cmp $b->[0]
-        } map {
-            [ lc($headers->[$_ * 2]) => $headers->[$_ * 2 + 1] ]
-        } 0..(@$headers / 2 - 1),
-    ];
-    return $ret if $ret < 0;
-    return +{
-        status  => $status,
-        message => $message,
-        headers => $headers,
-    };
-}
-
-sub connect_hq {
-    my $sock = IO::Socket::INET->new(
-        PeerAddr => "127.0.0.1:$port",
-        Proto    => 'tcp',
-    ) or die "failed to connect to hq:$!";
-    return $sock;
-}
-
 my $guard = start_hq($port);
 
-my $cs = connect_hq();
-my $ws = connect_hq();
+my $cs = connect_hq($port);
+my $ws = connect_hq($port);
 
 syswrite $ws, "START_WORKER * HTTP/1.1\r\n\r\n";
 my $r = read_response($ws);
@@ -105,7 +47,7 @@ is $buf, "hello\n", 'content';
 ok $cs->eof, 'client closed';
 
 # get 1.1 keepalive
-$cs = connect_hq();
+$cs = connect_hq($port);
 syswrite $cs, "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
 $r = read_request($ws);
 ok ref($r), "got request";
@@ -170,7 +112,7 @@ is $cs->read($buf, 16), 16, 'content size';
 is $buf, "6\r\nhidek\n\r\n0\r\n\r\n", 'content';
 
 # 1.1 keepalive with content-length, chunked on the worker side
-$ws = connect_hq();
+$ws = connect_hq($port);
 syswrite $ws, "START_WORKER * HTTP/1.1\r\n\r\n";
 ok ref(read_response($ws)), 'worker started';
 syswrite $cs, "GET / HTTP/1.0\r\n\r\n";
