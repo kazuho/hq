@@ -5,7 +5,6 @@ use IO::Handle;
 use HTTP::Parser::XS qw(:all);
 use Test::More;
 use Test::TCP qw(empty_port);
-use Scope::Guard;
 
 require 't/lib.pl';
 

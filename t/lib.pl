@@ -3,6 +3,7 @@ use warnings;
 
 use HTTP::Parser::XS qw(:all);
 use IO::Socket::INET;
+use Scope::Guard;
 
 sub start_hq {
     my $port = shift;
@@ -62,6 +63,12 @@ sub connect_hq {
         Proto    => 'tcp',
     ) or die "failed to connect to hq:$!";
     return $sock;
+}
+
+sub read_file {
+    open my $fh, '<', $_[0]
+        or die "failed to open file $_[0], $!";
+    join '', <$fh>;
 }
 
 1;
