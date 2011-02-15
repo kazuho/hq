@@ -221,8 +221,8 @@ void hq_handler::send_error(const hq_req_reader& req, hq_res_sender* res_sender,
   res_sender->close_response();
 }
 
-hq_client::hq_client(int fd)
-  : fd_(fd), req_()
+hq_client::hq_client(role r, int fd)
+  : role_(r), fd_(fd), req_()
 {
   ++*cac_mutex_t<size_t>::lockref(cnt_);
   picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
@@ -271,9 +271,15 @@ void hq_client::_read_request(int fd, int revents)
   }
   // if the connection is a worker, then...
   if (req_.method() == "START_WORKER") {
+    if (! (role_ == ROLE_ANY || role_ == ROLE_WORKER)) {
+      picoev_del(hq_loop::get_loop(), fd_);
+      hq_handler::send_error(req_, this, 403, "method not allowed");
+      return;
+    }
     int newfd = dup(fd_);
     if (newfd == -1) {
       picolog::error() << "dup(2) failed, " << hq_util::strerror(errno);
+      picoev_del(hq_loop::get_loop(), fd_);
       hq_handler::send_error(req_, this, 500, "dup failure");
       return;
     }
@@ -282,6 +288,11 @@ void hq_client::_read_request(int fd, int revents)
     return;
   }
   // is a client
+  if (! (role_ == ROLE_ANY || role_ == ROLE_CLIENT)) {
+    picoev_del(hq_loop::get_loop(), fd_);
+    hq_handler::send_error(req_, this, 403, "method not allowed");
+    return;
+  }
   picoev_del(hq_loop::get_loop(), fd_);
   hq_handler::dispatch_request(req_, this);
 }
@@ -580,7 +591,6 @@ hq_worker::handler::handler()
 
 hq_worker::handler::~handler()
 {
-  // TODO gracefully shutdown
 }
 
 bool hq_worker::handler::dispatch(const hq_req_reader& req, hq_res_sender* res_sender)
@@ -1127,41 +1137,18 @@ static void setup_sock(int fd)
   assert(r == 0);
 }
 
-hq_listener::config::config()
-  : picoopt::config_base<config>("port", required_argument,
+hq_listener::port_config::port_config()
+  : picoopt::config_base<port_config>("port", required_argument,
 				 "=[host:]port")
 {
 }
 
-int hq_listener::config::setup(const string* hostport, string& err)
+int hq_listener::port_config::setup(const string* hostport, string& err)
 {
-  unsigned short port;
-  if (sscanf(hostport->c_str(), "%hu", &port) != 1) {
-    err = "port should be a number";
-    return 1;
-  }
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  assert(fd != -1);
-  int r, flag = 1;
-  r = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
-  assert(r == 0);
-  struct sockaddr_in sa;
-  sa.sin_family = AF_INET;
-  sa.sin_port = htons(port);
-  sa.sin_addr.s_addr = htonl(0);
-  if (bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-    err = "failed to bind to port";
-    return 1;
-  }
-  setup_sock(fd);
-  r = listen(fd, SOMAXCONN);
-  assert(r == 0);
-  listeners_.push_back(new hq_listener(fd));
-  
-  return 0;
+  return hq_listener::_create_listener(hq_client::ROLE_ANY, *hostport, err);
 }
 
-int hq_listener::config::post_setup(string& err)
+int hq_listener::port_config::post_setup(string& err)
 {
   if (hq_listener::listeners_.empty()) {
     err = "should be set more than once";
@@ -1169,6 +1156,32 @@ int hq_listener::config::post_setup(string& err)
   }
   return 0;
 }
+
+#if 0
+
+hq_listener::client_port_config::client_port_config()
+  :  picoopt::config_base<client_port_config>("client-port", required_argument,
+					      "=[host:]port")
+{
+}
+
+int hq_listener::client_port_config::setup(const string* hostport, string& err)
+{
+  return hq_listener::_create_listener(hq_client::ROLE_CLIENT, *hostport, err);
+}
+
+hq_listener::worker_port_config::worker_port_config()
+  :  picoopt::config_base<worker_port_config>("worker-port", required_argument,
+					      "=[host:]port")
+{
+}
+
+int hq_listener::worker_port_config::setup(const string* hostport, string& err)
+{
+  return hq_listener::_create_listener(hq_client::ROLE_WORKER, *hostport, err);
+}
+
+#endif
 
 hq_listener::max_connections_config::max_connections_config()
   : picoopt::config_base<max_connections_config>("max-connections",
@@ -1251,12 +1264,43 @@ void hq_listener::_accept(int fd, int revents)
     return;
   }
   setup_sock(newfd);
-  new hq_client(newfd);
+  new hq_client(role_, newfd);
 }
 
 std::list<hq_listener*> hq_listener::listeners_;
 pthread_mutex_t hq_listener::listeners_mutex_ = PTHREAD_MUTEX_INITIALIZER;
 int hq_listener::max_connections_ = 151;
+
+int hq_listener::_create_listener(const hq_client::role& role,
+				  const string& hostport, string& err)
+{
+  unsigned short port;
+  // TODO parse the host: part
+  // TODO IPv6 support
+  if (sscanf(hostport.c_str(), "%hu", &port) != 1) {
+    err = "port should be a number";
+    return 1;
+  }
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  assert(fd != -1);
+  int r, flag = 1;
+  r = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+  assert(r == 0);
+  struct sockaddr_in sa;
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(port);
+  sa.sin_addr.s_addr = htonl(0);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+    err = "failed to bind to port";
+    return 1;
+  }
+  setup_sock(fd);
+  r = listen(fd, SOMAXCONN);
+  assert(r == 0);
+  listeners_.push_back(new hq_listener(role, fd));
+  
+  return 0;
+}
 
 hq_loop::hq_loop()
 {

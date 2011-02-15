@@ -364,12 +364,18 @@ public:
  */
 class hq_client : public hq_res_sender, public hq_loop::stoppable {
 public:
+  enum role {
+    ROLE_ANY,
+    ROLE_CLIENT,
+    ROLE_WORKER
+  };
   enum response_mode {
     RESPONSE_MODE_HTTP10, /* not chunked */
     RESPONSE_MODE_CHUNKED,
     RESPONSE_MODE_SENDFILE
   };
 protected:
+  role role_;
   int fd_;
   hq_req_reader req_;
   struct {
@@ -393,7 +399,7 @@ public:
   /**
    * constructor
    */
-  hq_client(int fd);
+  hq_client(role r, int fd);
   /**
    * destructor
    */
@@ -525,11 +531,21 @@ public:
 
 class hq_listener {
 public:
-  struct config : public picoopt::config_base<config> {
-    config();
+  struct port_config : public picoopt::config_base<port_config> {
+    port_config();
     virtual int setup(const std::string* hostport, std::string& err);
     virtual int post_setup(std::string& err);
   };
+#if 0
+  struct client_port_config : public picoopt::config_base<client_port_config> {
+    client_port_config();
+    virtual int setup(const std::string* hostport, std::string& err);
+  };
+  struct worker_port_config : public picoopt::config_base<worker_port_config> {
+    worker_port_config();
+    virtual int setup(const std::string* hostport, std::string& err);
+  };
+#endif
   struct max_connections_config
     : public picoopt::config_base<max_connections_config> {
     max_connections_config();
@@ -544,11 +560,12 @@ public:
   };
   friend class poll_guard;
 protected:
+  hq_client::role role_;
   int listen_fd_;
 protected:
   void _accept(int fd, int revents);
 private:
-  hq_listener(int listen_fd) : listen_fd_(listen_fd) {}
+  hq_listener(const hq_client::role& role, int listen_fd) : role_(role), listen_fd_(listen_fd) {}
   hq_listener(const hq_listener&); // not defined
   ~hq_listener();
   hq_listener& operator=(const hq_listener&); // not defined
@@ -561,6 +578,8 @@ public:
    * returns number of the listeners
    */
   static size_t num_listeners() { return listeners_.size(); }
+private:
+  static int _create_listener(const hq_client::role& role, const std::string& hostport, std::string& err);
 };
 
 class hq_static_handler : public hq_handler {
