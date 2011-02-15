@@ -19,6 +19,46 @@ extern "C" {
 #include "picoopt/picoopt.h"
 
 /**
+ * utility class for running a thread
+ */
+template<typename T> class hq_runnable {
+protected:
+  T* obj_;
+  void* (T::*func_)();
+  pthread_t* tid_;
+  bool stop_requested_;
+public:
+  hq_runnable(T* obj, void* (T::*func)()) : obj_(obj), func_(func), tid_(NULL), stop_requested_(false) {}
+  ~hq_runnable() {
+    if (tid_ != NULL) {
+      request_stop();
+      join(NULL);
+    }
+  }
+  void start(const pthread_attr_t* attr = NULL) {
+    assert(tid_ == NULL);
+    tid_ = new pthread_t;
+    pthread_create(tid_, attr, _start, this);
+  }
+  bool stop_requested() const { return stop_requested_; }
+  void request_stop() { stop_requested_ = true; }
+  void join(void** value_ptr) {
+    assert(tid_ != NULL);
+    pthread_join(*tid_, value_ptr);
+    delete tid_;
+    tid_ = NULL;
+  }
+private:
+  hq_runnable(const hq_runnable&); // not defined
+  hq_runnable& operator=(const hq_runnable&); // not defined
+private:
+  static void* _start(void* _self) {
+    hq_runnable* self = (hq_runnable*)_self;
+    return (self->obj_->*self->func_)();
+  }
+};
+
+/**
  * utility class for tls
  */
 template <typename T> class hq_tls {
@@ -364,6 +404,10 @@ public:
  */
 class hq_client : public hq_res_sender, public hq_loop::stoppable {
 public:
+  struct io_timeout_config : public picoopt::config_base<io_timeout_config> {
+    io_timeout_config();
+    virtual int setup(const std::string* secs, std::string& err);
+  };
   enum response_mode {
     RESPONSE_MODE_HTTP10, /* not chunked */
     RESPONSE_MODE_CHUNKED,
@@ -418,6 +462,11 @@ private:
   hq_client& operator=(const hq_client&); // not defined
 public:
   static cac_mutex_t<size_t> cnt_;
+protected:
+  static int timeout_;
+  static int keepalive_timeout_;
+public:
+  static int timeout() { return timeout_; }
 };
 
 /**
@@ -425,6 +474,13 @@ public:
  */
 class hq_worker {
 public:
+  /**
+   * timeout
+   */
+  struct queue_timeout_config : public picoopt::config_base<queue_timeout_config> {
+    queue_timeout_config();
+    virtual int setup(const std::string* seconds, std::string& err);
+  };
   /**
    * handler
    */
@@ -436,8 +492,8 @@ public:
     struct req_queue_entry {
       const hq_req_reader* req;
       hq_res_sender* res_sender;
-      req_queue_entry(const hq_req_reader* r, hq_res_sender* rs)
-	: req(r), res_sender(rs) {}
+      time_t at;
+      req_queue_entry(const hq_req_reader* r, hq_res_sender* rs);
     };
   protected:
     /**
@@ -445,7 +501,7 @@ public:
      */
     struct junction {
       std::list<req_queue_entry> reqs;
-      std::list<hq_worker*> workers;
+      std::list<std::pair<hq_worker*, time_t> > workers;
     };
     cac_mutex_t<junction> junction_;
   public:
@@ -461,6 +517,7 @@ public:
      * dispatches a request
      */
     virtual bool dispatch(const hq_req_reader& req, hq_res_sender* res_sender);
+    void trash_idle_connections();
   protected:
     /**
      * starts a worker if any pending request exists, or registers the worker to wait for requests
@@ -518,9 +575,11 @@ private:
 public:
   static cac_mutex_t<size_t> cnt_;
 protected:
-  static handler handler_;
+  static handler* handler_;
+  static int queue_timeout_;
 public:
   static void setup();
+  static void trash_idle_connections() { handler_->trash_idle_connections(); }
 };
 
 class hq_listener {

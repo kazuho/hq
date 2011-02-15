@@ -222,6 +222,21 @@ void hq_handler::send_error(const hq_req_reader& req, hq_res_sender* res_sender,
   res_sender->close_response();
 }
 
+hq_client::io_timeout_config::io_timeout_config()
+  : picoopt::config_base<io_timeout_config>("io-timeout", required_argument,
+					    "=seconds")
+{
+}
+
+int hq_client::io_timeout_config::setup(const string* secs, string& err)
+{
+  if (sscanf(secs->c_str(), "%d", &timeout_) != 1 || timeout_ <= 0) {
+    err = "timeout should be a positive number";
+    return 1;
+  }
+  return 0;
+}
+
 hq_client::hq_client(int fd)
   : fd_(fd), req_()
 {
@@ -246,6 +261,7 @@ void hq_client::_reset(bool is_keep_alive)
   res_.sendbuf.clear();
   keep_alive_ = false;
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_READ);
+  picoev_set_timeout(hq_loop::get_loop(), fd_, timeout());
   picoev_set_callback(hq_loop::get_loop(), fd_,
 		      hq_picoev_cb<hq_client, &hq_client::_read_request>, NULL);
   if (is_keep_alive) {
@@ -258,6 +274,14 @@ void hq_client::_read_request(int fd, int revents)
   assert(fd == fd_);
   assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
   
+  // timeout
+  if ((revents & PICOEV_TIMEOUT) != 0) {
+    picolog::info() << picolog::mem_fun(hq_util::gethostof, fd_)
+		    << " timeout while reading request";
+    delete this;
+    return;
+  }
+  
   if (req_.empty()) {
     hq_loop::unregister_stoppable(this);
   }
@@ -268,6 +292,7 @@ void hq_client::_read_request(int fd, int revents)
     return;
   }
   if (! req_.is_complete()) {
+    picoev_set_timeout(hq_loop::get_loop(), fd_, timeout());
     return;
   }
   // if the connection is a worker, then...
@@ -358,6 +383,7 @@ void hq_client::close_response()
 void hq_client::_prepare_response(int status, const string& msg, const hq_headers& headers, const int sendfile_fd)
 {
   picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
+  picoev_set_timeout(hq_loop::get_loop(), fd_, timeout());
   
   res_.status = status;
   res_.sendbuf.clear();
@@ -465,6 +491,14 @@ void hq_client::_write_sendfile_cb(int fd, int revents)
   assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
   assert(res_.mode == RESPONSE_MODE_SENDFILE);
   
+  // timeout
+  if ((revents & PICOEV_TIMEOUT) != 0) {
+    picolog::info() << picolog::mem_fun(hq_util::gethostof, fd_)
+		    << " timeout while sending response";
+    _finalize_response(false);
+    return;
+  }
+  
   // flush header
   if (! res_.sendbuf.empty()) {
     if (! _write_sendbuf(false)) {
@@ -515,6 +549,14 @@ void hq_client::_write_sendbuf_cb(int fd, int revents)
   assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
   assert(res_.mode == RESPONSE_MODE_HTTP10
 	 || res_.mode == RESPONSE_MODE_CHUNKED);
+  
+  // timeout
+  if ((revents & PICOEV_TIMEOUT) != 0) {
+    picolog::info() << picolog::mem_fun(hq_util::gethostof, fd_)
+		    << " timeout while sending response";
+    _finalize_response(false);
+    return;
+  }
   
   if (! _write_sendbuf(true)) {
     _finalize_response(false);
@@ -574,6 +616,31 @@ void hq_client::from_loop_request_stop()
 }
 
 cac_mutex_t<size_t> hq_client::cnt_(NULL);
+int hq_client::timeout_ = 90;
+
+hq_worker::queue_timeout_config::queue_timeout_config()
+  : picoopt::config_base<queue_timeout_config>("queue-timeout",
+					       required_argument,
+					       "=seconds")
+{
+}
+
+int hq_worker::queue_timeout_config::setup(const string* seconds, string& err)
+{
+  if (sscanf(seconds->c_str(), "%d", &queue_timeout_) != 1
+      || queue_timeout_ <= 0) {
+    err = "queue-timeout should be a positive number";
+    return 1;
+  }
+  return 0;
+}
+
+hq_worker::handler::req_queue_entry::req_queue_entry(const hq_req_reader* r,
+						     hq_res_sender* rs)
+  : req(r), res_sender(rs)
+{
+  time(&at);
+}
 
 hq_worker::handler::handler()
   : junction_(NULL)
@@ -594,7 +661,7 @@ bool hq_worker::handler::dispatch(const hq_req_reader& req, hq_res_sender* res_s
     if (junction->workers.empty()) {
       junction->reqs.push_back(req_queue_entry(&req, res_sender));
     } else {
-      worker = junction->workers.front();
+      worker = junction->workers.front().first;
       junction->workers.pop_front();
     }
   }
@@ -611,12 +678,43 @@ void hq_worker::handler::_start_worker_or_register(hq_worker* worker)
   cac_mutex_t<junction>::lockref junction(junction_);
   
   if (junction->reqs.empty()) {
-    junction->workers.push_back(worker);
+    junction->workers.push_back(make_pair(worker, time(NULL)));
     return;
   }
   req_queue_entry r(junction->reqs.front());
   junction->reqs.pop_front();
   worker->_start(r.req, r.res_sender);
+}
+
+void hq_worker::handler::trash_idle_connections()
+{
+  if (queue_timeout_ == 0) {
+    return;
+  }
+  
+  cac_mutex_t<junction>::lockref junction(junction_);
+  time_t now = time(NULL);
+  
+  while (! junction->reqs.empty()) {
+    req_queue_entry r(*junction->reqs.begin());
+    if (now <= r.at + queue_timeout_) {
+      break;
+    }
+    picolog::error() << "could not handle " << r.req->method() << ' '
+		     << r.req->path() << ", timeout occured"; 
+    hq_handler::send_error(*r.req, r.res_sender, 500,
+			   "Request Timeout");
+    junction->reqs.pop_front();
+  }
+  while (! junction->workers.empty()) {
+    pair<hq_worker*, time_t> e(*junction->workers.begin());
+    if (now <= e.second + queue_timeout_) {
+      break;
+    }
+    // TODO log the closing, but how to get the fd_?
+    delete e.first;
+    junction->workers.pop_front();
+  }
 }
 
 hq_worker::hq_worker(int fd, const hq_req_reader&)
@@ -633,7 +731,9 @@ hq_worker::~hq_worker()
 {
   assert(req_ == NULL);
   assert(res_sender_ == NULL);
-  picoev_del(hq_loop::get_loop(), fd_);
+  if (picoev_is_active(hq_loop::get_loop(), fd_)) {
+    picoev_del(hq_loop::get_loop(), fd_);
+  }
   close(fd_);
   --*cac_mutex_t<size_t>::lockref(cnt_);
 }
@@ -643,14 +743,24 @@ void hq_worker::_send_upgrade(int fd, int revents)
   assert(fd == fd_);
   assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
   
+  // timeout
+  if ((revents & PICOEV_TIMEOUT) != 0) {
+    picolog::info() << picolog::mem_fun(hq_util::gethostof,fd)
+		    << " closing worker due to timeout while sending request";
+    delete this;
+    return;
+  }
+  
   if (! _send_buffer()) {
     picolog::info() << picolog::mem_fun(hq_util::gethostof, fd)
 		    << " worker closed the connection unexpectedly, "
 		    << hq_util::strerror(errno);
     delete this;
+    return;
   }
   if (! buf_.empty()) {
     picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
+    picoev_set_timeout(hq_loop::get_loop(), fd_, hq_client::timeout());
     picoev_set_callback(hq_loop::get_loop(), fd_,
 			hq_picoev_cb<hq_worker, &hq_worker::_send_upgrade>,
 			NULL);
@@ -664,9 +774,11 @@ void hq_worker::_prepare_next()
   assert(req_ == NULL);
   assert(res_sender_ == NULL);
   
-  picoev_set_events(hq_loop::get_loop(), fd_, 0);
+  if (picoev_is_active(hq_loop::get_loop(), fd_)) {
+    picoev_del(hq_loop::get_loop(), fd_);
+  }
   // fetch the request immediately or register myself to dispatcher
-  handler_._start_worker_or_register(this);
+  handler_->_start_worker_or_register(this);
 }
 
 void hq_worker::_start(const hq_req_reader* req, hq_res_sender* res_sender)
@@ -696,6 +808,7 @@ void hq_worker::_start(const hq_req_reader* req, hq_res_sender* res_sender)
   }
   buf_.push("\r\n", 2);
   
+  picoev_add(hq_loop::get_loop(), fd_, 0, 0, NULL, this);
   _send_request();
 }
 
@@ -703,6 +816,15 @@ void hq_worker::_send_request_cb(int fd, int revents)
 {
   assert(fd == fd_);
   assert((revents & ~(PICOEV_WRITE | PICOEV_TIMEOUT)) == 0);
+  
+  // timeout
+  if ((revents & PICOEV_TIMEOUT) != 0) {
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+		     << " timeout while sending request to worker";
+    _return_error(500, "worker timeout");
+    delete this;
+    return;
+  }
   
   _send_request();
 }
@@ -715,6 +837,7 @@ void hq_worker::_send_request()
   }
   if (! buf_.empty()) {
     picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_WRITE);
+    picoev_set_timeout(hq_loop::get_loop(), fd_, hq_client::timeout());
     picoev_set_callback(hq_loop::get_loop(), fd_,
 			hq_picoev_cb<hq_worker, &hq_worker::_send_request_cb>,
 			NULL);
@@ -722,6 +845,7 @@ void hq_worker::_send_request()
   }
   // sent all data, wait for response
   picoev_set_events(hq_loop::get_loop(), fd_, PICOEV_READ);
+  picoev_set_timeout(hq_loop::get_loop(), fd_, hq_client::timeout());
   picoev_set_callback(hq_loop::get_loop(), fd_,
 		      hq_picoev_cb<hq_worker,
 		                   &hq_worker::_read_response_header>,
@@ -737,6 +861,15 @@ void hq_worker::_read_response_header(int fd, int revents)
 {
   assert(fd == fd_);
   assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
+  
+  // timeout
+  if ((revents & PICOEV_TIMEOUT) != 0) {
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+		     << " timeout while receiving response from worker";
+    _return_error(500, "worker timeout");
+    delete this;
+    return;
+  }
   
   int status, minor_version, r;
   string msg;
@@ -922,6 +1055,12 @@ void hq_worker::_read_response_http10(int fd, int revents)
   
   size_t send_len;
   
+  if ((revents & PICOEV_TIMEOUT) != 0) {
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+		     << " timeout while receiving response content from worker";
+    goto CLOSE;
+  }
+  
   if (! _recv_buffer()) {
     goto CLOSE;
   }
@@ -972,6 +1111,13 @@ void hq_worker::_read_response_chunked(int fd, int revents)
 {
   assert(fd == fd_);
   assert((revents & ~(PICOEV_READ | PICOEV_TIMEOUT)) == 0);
+  
+  if ((revents & PICOEV_TIMEOUT) != 0) {
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+		     << " timeout while receiving response content from worker";
+    delete this;
+    return;
+  }
   
   if (! _recv_buffer()) {
     if (res_sender_ != NULL) {
@@ -1119,11 +1265,14 @@ void hq_worker::_push_chunked_data()
 }
 
 cac_mutex_t<size_t> hq_worker::cnt_(NULL);
-hq_worker::handler hq_worker::handler_;
+hq_worker::handler* hq_worker::handler_ = NULL;
+int hq_worker::queue_timeout_ = 30;
 
 void hq_worker::setup()
 {
-  hq_handler::handlers_.push_back(&handler_);
+  assert(handler_ == NULL);
+  handler_ = new handler;
+  hq_handler::handlers_.push_back(handler_);
 }
 
 static void setup_sock(int fd)
@@ -1283,6 +1432,7 @@ void hq_loop::run_loop()
     {
       hq_listener::poll_guard pg;
       picoev_loop_once(*loop_, 1);
+      hq_worker::trash_idle_connections();
     }
     if (stop_) {
       while (! stoppables_->empty()) {
