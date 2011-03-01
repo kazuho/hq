@@ -95,7 +95,7 @@ bool hq_chunked_decoder::decode(hq_buffer& buf, string& err)
       }
       long long unsigned t;
       if (sscanf(buf.buffer(), "%llx", &t) != 1) {
-	err = "recevied a broken chunked content";
+	err = "received a broken chunked content";
 	return false;
       }
       size_ = t;
@@ -1146,7 +1146,7 @@ void hq_worker::_read_response(int fd, int revents)
   req_ = NULL;
   res_sender_ = NULL;
   if (! err.empty()) {
-    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd)
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd) << ' '
 		     << err;
     goto CLOSE;
   } else if (! buf_.empty()) {
@@ -1206,7 +1206,7 @@ void hq_worker::_push_content()
   }
   // eof or error
   if (! err.empty()) {
-    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_)
+    picolog::error() << picolog::mem_fun(hq_util::gethostof, fd_) << ' '
 		     << err;
     keep_alive_ = false;
   }
