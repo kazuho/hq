@@ -269,6 +269,50 @@ public:
 };
 
 /**
+ * decoder
+ */
+class hq_decoder {
+public:
+  struct handler {
+    virtual void do_handle_decoded_content(const char* data, size_t length) = 0;
+  };
+protected:
+  handler* handler_;
+public:
+  hq_decoder(handler* handler) : handler_(handler) {}
+  virtual ~hq_decoder() {}
+  virtual bool decode(hq_buffer& buf, std::string& err) = 0;
+protected:
+  void _handle_decoded_content(const char* data, size_t length) {
+    return handler_->do_handle_decoded_content(data, length);
+  }
+};
+
+/**
+ * content-length decoder
+ */
+class hq_clen_decoder : public hq_decoder {
+protected:
+  int64_t off_;
+  int64_t size_; // -1 if none
+public:
+  hq_clen_decoder(handler* handler, int64_t size) : hq_decoder(handler), off_(0), size_(size) {}
+  virtual bool decode(hq_buffer& buf, std::string& err);
+};
+
+/**
+ * chunked decoder
+ */
+class hq_chunked_decoder : public hq_decoder {
+protected:
+  int64_t off_; // becomes chunk_off == chunk_size while waiting for trailing CRLFs
+  int64_t size_; // -1 if not initialized
+public:
+  hq_chunked_decoder(handler* handler) : hq_decoder(handler), off_(0), size_(-1) {}
+  virtual bool decode(hq_buffer& buf, std::string& err);
+};
+
+/**
  * reads a HTTP request
  */
 class hq_req_reader {
@@ -478,7 +522,7 @@ public:
 /**
  * Worker
  */
-class hq_worker {
+class hq_worker : public hq_decoder::handler {
 public:
   /**
    * timeout
@@ -530,29 +574,13 @@ public:
      */
     void _start_worker_or_register(hq_worker* worker);
   };
-  enum response_mode {
-    RESPONSE_MODE_HTTP10, // content-length or non-persistent
-    RESPONSE_MODE_CHUNKED
-  };
 protected:
   int fd_;
   const hq_req_reader* req_;
   hq_res_sender* res_sender_;
   hq_buffer buf_; // used for both send and recv
   bool keep_alive_;
-  struct {
-    response_mode mode;
-    union {
-      struct {
-	int64_t off;
-	int64_t content_length; // -1 if no content-length
-      } http10;
-      struct {
-	int64_t chunk_off;  // becomes chunk_off == chunk_size while waiting for trailing CRLFs
-	int64_t chunk_size; // -1 if not initialized
-      } chunked;
-    } u;
-  } res_;
+  hq_decoder* decoder_;
 public:
   /**
    * constructor
@@ -569,12 +597,12 @@ protected:
   void _send_request_cb(int fd, int revents);
   void _send_request();
   void _read_response_header(int fd, int revents);
-  void _read_response_http10(int fd, int revents);
-  void _read_response_chunked(int fd, int revents);
+  void _read_response(int fd, int revents);
   void _return_error(int status, const std::string& msg);
   bool _send_buffer();
   bool _recv_buffer(bool* closed = NULL);
-  void _push_chunked_data();
+  void _push_content();
+  virtual void do_handle_decoded_content(const char* data, size_t length);
 private:
   hq_worker(const hq_worker&); // not defined
   hq_worker& operator=(const hq_worker&); // not defined
